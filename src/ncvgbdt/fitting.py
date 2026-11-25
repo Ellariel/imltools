@@ -48,6 +48,7 @@ import pandas as pd
 from lightgbm import LGBMClassifier
 from lightgbm import LGBMRegressor
 from scipy.stats import loguniform
+from scipy.stats import t
 from scipy.stats import uniform
 from shap import Explanation
 from shap.explainers import Tree as TreeExplainer
@@ -55,6 +56,10 @@ from sklearn.base import clone
 from sklearn.compose import ColumnTransformer
 from sklearn.compose import TransformedTargetRegressor
 from sklearn.metrics import accuracy_score
+from sklearn.metrics import cohen_kappa_score
+from sklearn.metrics import f1_score
+from sklearn.metrics import matthews_corrcoef
+from sklearn.metrics import roc_auc_score
 from sklearn.metrics import make_scorer
 from sklearn.metrics import mean_absolute_error
 from sklearn.metrics import mean_squared_error
@@ -848,6 +853,184 @@ def tune_pipe(task, i_cv, pipe, space, g_trn, x_trn, y_trn):
     return search.best_estimator_, search.best_params_
 
 
+def corrected_std(differences, n_tst_over_n_trn=0.25):
+    '''
+    Corrects standard deviation using Nadeau and Bengio's approach.
+    Ref: Nadeau, C., Bengio, Y. Inference for the Generalization Error.
+    Machine Learning 52, 239–281 (2003).
+    https://doi.org/10.1023/A:1024068626366
+    Ref: https://scikit-learn.org/stable/auto_examples/model_selection/
+    plot_grid_search_stats.html
+
+    Parameters
+    ----------
+    differences : ndarray of shape (n_samples,)
+        Vector containing the differences in the score metrics of two models.
+    n_tst_over_n_trn : float
+        Number of samples in the testing set over number of samples in the
+        training set.
+
+    Returns
+    -------
+    corrected_std : float
+        Variance-corrected standard deviation of the set of differences.
+    '''
+
+    # Get corrected std -------------------------------------------------------
+    # kr = k times r, r times repeated k-fold crossvalidation,
+    # kr equals the number of times the model was evaluated
+    kr = len(differences)
+    # Corrected variance
+    corrected_var = np.var(differences, ddof=1) * (1/kr + n_tst_over_n_trn)
+    # Corrected standard deviation
+    corrected_std = np.sqrt(corrected_var)
+
+    # Return corrected standard deviation -------------------------------------
+    return corrected_std
+
+
+def corrected_ttest(differences, n_tst_over_n_trn=0.25):
+    '''
+    Computes right-tailed paired t-test with corrected variance (H1: mean
+    of ``differences`` > 0).
+    Ref: Nadeau, C., Bengio, Y. Inference for the Generalization Error.
+    Machine Learning 52, 239–281 (2003).
+    https://doi.org/10.1023/A:1024068626366
+    Ref: https://scikit-learn.org/stable/auto_examples/model_selection/
+    plot_grid_search_stats.html
+
+    Parameters
+    ----------
+    differences : array-like of shape (n_samples,)
+        Vector containing the differences in the score metrics of two models.
+    n_tst_over_n_trn : float
+        Number of samples in the testing set over number of samples in the
+        training set.
+
+    Returns
+    -------
+    t_stat : float
+        Variance-corrected t-statistic.
+    p_val : float
+        Variance-corrected p-value.
+    '''
+
+    # Compute t statistics and p value ----------------------------------------
+    # Get mean of differences
+    mean = np.mean(differences)
+    # Get corrected standard deviation
+    std = corrected_std(differences, n_tst_over_n_trn)
+    # Compute t statistics
+    if std >= 0.0 and std <= 0.0000001: # for technical purposes
+        t_stat = 0.0
+        p_val = 1.0
+    else:
+        # Compute p value for right-tailed t-test (H1: mean > 0). A negative
+        # t statistic (first model worse than second) is not significant.
+        t_stat = mean / std
+        p_val = t.sf(t_stat, df=len(differences)-1)
+    # Return t statistics and p value -----------------------------------------
+    return t_stat, p_val
+
+
+REGRESSION_METRICS = ("r2", "mae", "mse", "rmse")
+BINARY_METRICS = ("acc", "auc", "logloss", "brier", "mcc", "kappa", "f1_macro",
+                  "mcfadden", "cox_snell", "nagelkerke", "tjur")
+MULTICLASS_METRICS = tuple(m for m in BINARY_METRICS if m != "tjur")
+# Metrics for which smaller is better
+LOWER_IS_BETTER = ("mae", "mse", "rmse", "logloss", "brier")
+
+
+def metrics_for(objective):
+    """Names of the scores computed for an objective (first one: main score)."""
+    return {"regression": REGRESSION_METRICS, "binary": BINARY_METRICS,
+            "multiclass": MULTICLASS_METRICS}[objective]
+
+
+def classification_metrics(y_true, y_pred, proba, classes, class_weights):
+    """
+    Out-of-sample scores of a classifier.
+
+    All probability based metrics are **class-balanced**: every sample is
+    weighted by the weight of its class (inverse class frequency, see
+    :func:`get_class_w`) and the null model assigns equal probability to
+    every class. This matches the balanced class weights the models are
+    trained with (their probabilities reflect equal class priors).
+
+    Parameters
+    ----------
+    y_true, y_pred : array-like (n_samples,)
+        True and predicted labels.
+    proba : ndarray (n_samples, n_classes)
+        Predicted class probabilities, columns ordered as ``classes``.
+    classes : array-like (n_classes,)
+        Class labels.
+    class_weights : dict
+        Class label -> weight.
+
+    Returns
+    -------
+    dict
+        ``acc`` balanced accuracy; ``auc`` area under the ROC curve (binary,
+        else macro one-vs-rest; not weighted); ``logloss`` weighted log loss;
+        ``brier`` weighted Brier score (binary: squared error of the
+        positive-class probability, multiclass: summed over classes);
+        ``mcc`` Matthews correlation coefficient and ``kappa`` Cohen's kappa
+        (both on the labels, unweighted); ``f1_macro`` macro F1;
+        ``mcfadden`` ``1 - ll_model / ll_null``; ``cox_snell`` and
+        ``nagelkerke`` R2 from the same log-likelihoods (``1 - exp(2 *
+        (ll_null - ll_model))``, the latter scaled to a maximum of 1);
+        ``tjur`` (binary only, else NaN) mean predicted positive-class
+        probability of the positive class minus that of the negative class.
+        Here ``ll`` is the weighted mean log-likelihood per sample. The
+        pseudo R2 values are computed on test data and can be negative.
+    """
+
+    y_true = np.asarray(y_true).ravel()
+    y_pred = np.asarray(y_pred).ravel()
+    classes = np.asarray(classes)
+    k = len(classes)
+    idx = pd.Index(classes).get_indexer(y_true)
+    weights = pd.Series(y_true).map(class_weights).to_numpy(dtype=float)
+    out = {m: np.nan for m in BINARY_METRICS}
+    out["acc"] = float(np.average(y_pred == y_true, weights=weights))
+    out["mcc"] = float(matthews_corrcoef(y_true, y_pred))
+    out["kappa"] = float(cohen_kappa_score(y_true, y_pred))
+    out["f1_macro"] = float(f1_score(y_true, y_pred, average="macro",
+                                     zero_division=0))
+    if (idx < 0).any():
+        # A test label the model never saw: probability metrics undefined
+        return out
+    p = np.clip(np.asarray(proba, dtype=float), 1e-15, 1.0)
+    onehot = np.eye(k)[idx]
+    # Log-likelihoods per sample (weighted mean); null: equal probabilities
+    ll = float(np.average(np.log(p[np.arange(len(idx)), idx]),
+                          weights=weights))
+    ll0 = -np.log(k)
+    out["logloss"] = -ll
+    out["mcfadden"] = 1.0 - ll / ll0
+    out["cox_snell"] = 1.0 - np.exp(2.0 * (ll0 - ll))
+    out["nagelkerke"] = out["cox_snell"] / (1.0 - np.exp(2.0 * ll0))
+    if k == 2:
+        out["brier"] = float(np.average((p[:, 1] - onehot[:, 1]) ** 2,
+                                        weights=weights))
+        if (idx == 0).any() and (idx == 1).any():
+            out["tjur"] = float(p[idx == 1, 1].mean() - p[idx == 0, 1].mean())
+    else:
+        out["brier"] = float(np.average(((p - onehot) ** 2).sum(axis=1),
+                                        weights=weights))
+    try:
+        if k == 2:
+            out["auc"] = float(roc_auc_score(onehot[:, 1], p[:, 1]))
+        else:
+            out["auc"] = float(roc_auc_score(
+                y_true, p / p.sum(axis=1, keepdims=True), multi_class="ovr",
+                average="macro", labels=classes))
+    except ValueError:
+        pass  # a class is missing in the test data
+    return {k_: float(v) for k_, v in out.items()}
+
+
 def score_predictions(task, pipe, x_tst, y_tst, y):
     """
     Compute scores for predictions based on task.
@@ -868,8 +1051,9 @@ def score_predictions(task, pipe, x_tst, y_tst, y):
     Returns
     -------
     scores : dict
-        Returns scoring results. MAE, MSE and R² if task is regression.
-        ACC and true class weights if task is classification.
+        Returns scoring results. R², MAE, MSE and RMSE if task is
+        regression. If task is classification: predicted probabilities,
+        class weights and the metrics of :func:`classification_metrics`.
     """
 
     # Predict -----------------------------------------------------------------
@@ -891,20 +1075,28 @@ def score_predictions(task, pipe, x_tst, y_tst, y):
             "y_pred": y_pred,
             "mae": mae,
             "mse": mse,
+            "rmse": float(np.sqrt(mse)),
             "r2": r2,
         }
     # Classification
     elif task["OBJECTIVE"] == "binary" or task["OBJECTIVE"] == "multiclass":
         # Get class weights
         class_weights = get_class_w(y)
-        # Calculate model fit in terms of acc
-        acc = weighted_accuracy_score(y_tst, y_pred, class_weights)
+        # Predicted probabilities, columns ordered as pipe.classes_
+        proba = pipe.predict_proba(x_tst)
+        # Metrics (balanced accuracy, AUC, log loss, pseudo R2, ...)
+        metrics = classification_metrics(
+            y_tst.squeeze().to_numpy(), y_pred, proba, pipe.classes_,
+            class_weights)
+        if task["OBJECTIVE"] == "multiclass":
+            metrics.pop("tjur")
         # Results
         scores = {
             "y_true": y_tst.squeeze().to_numpy(),
             "y_pred": y_pred,
-            "acc": acc,
+            "y_proba": proba,
             "class_weights": class_weights,
+            **metrics,
         }
     # Other
     else:

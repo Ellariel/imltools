@@ -18,13 +18,14 @@ import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 import seaborn as sns
-from scipy.stats import t
 from shap import Explanation
 from shap import dependence_plot
 from shap.plots import beeswarm
 from shap.plots import scatter
 from sklearn.metrics import confusion_matrix
 
+from .fitting import corrected_std  # noqa: F401
+from .fitting import corrected_ttest
 from .fitting import create_dir
 
 
@@ -67,86 +68,6 @@ def get_stars(p, p001='***', p01='** ', p05='*  ', p10='⁺  ', p_='    '):
     if p < 0.100:
         return p10
     return p_
-
-
-def corrected_std(differences, n_tst_over_n_trn=0.25):
-    '''
-    Corrects standard deviation using Nadeau and Bengio's approach.
-    Ref: Nadeau, C., Bengio, Y. Inference for the Generalization Error.
-    Machine Learning 52, 239–281 (2003).
-    https://doi.org/10.1023/A:1024068626366
-    Ref: https://scikit-learn.org/stable/auto_examples/model_selection/
-    plot_grid_search_stats.html
-
-    Parameters
-    ----------
-    differences : ndarray of shape (n_samples,)
-        Vector containing the differences in the score metrics of two models.
-    n_tst_over_n_trn : float
-        Number of samples in the testing set over number of samples in the
-        training set.
-
-    Returns
-    -------
-    corrected_std : float
-        Variance-corrected standard deviation of the set of differences.
-    '''
-
-    # Get corrected std -------------------------------------------------------
-    # kr = k times r, r times repeated k-fold crossvalidation,
-    # kr equals the number of times the model was evaluated
-    kr = len(differences)
-    # Corrected variance
-    corrected_var = np.var(differences, ddof=1) * (1/kr + n_tst_over_n_trn)
-    # Corrected standard deviation
-    corrected_std = np.sqrt(corrected_var)
-
-    # Return corrected standard deviation -------------------------------------
-    return corrected_std
-
-
-def corrected_ttest(differences, n_tst_over_n_trn=0.25):
-    '''
-    Computes right-tailed paired t-test with corrected variance (H1: mean
-    of ``differences`` > 0).
-    Ref: Nadeau, C., Bengio, Y. Inference for the Generalization Error.
-    Machine Learning 52, 239–281 (2003).
-    https://doi.org/10.1023/A:1024068626366
-    Ref: https://scikit-learn.org/stable/auto_examples/model_selection/
-    plot_grid_search_stats.html
-
-    Parameters
-    ----------
-    differences : array-like of shape (n_samples,)
-        Vector containing the differences in the score metrics of two models.
-    n_tst_over_n_trn : float
-        Number of samples in the testing set over number of samples in the
-        training set.
-
-    Returns
-    -------
-    t_stat : float
-        Variance-corrected t-statistic.
-    p_val : float
-        Variance-corrected p-value.
-    '''
-
-    # Compute t statistics and p value ----------------------------------------
-    # Get mean of differences
-    mean = np.mean(differences)
-    # Get corrected standard deviation
-    std = corrected_std(differences, n_tst_over_n_trn)
-    # Compute t statistics
-    if std >= 0.0 and std <= 0.0000001: # for technical purposes
-        t_stat = 0.0
-        p_val = 1.0
-    else:
-        # Compute p value for right-tailed t-test (H1: mean > 0). A negative
-        # t statistic (first model worse than second) is not significant.
-        t_stat = mean / std
-        p_val = t.sf(t_stat, df=len(differences)-1)
-    # Return t statistics and p value -----------------------------------------
-    return t_stat, p_val
 
 
 def print_parameter_distributions(task, results, plots_path):

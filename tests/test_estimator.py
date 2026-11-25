@@ -152,6 +152,50 @@ def test_fitted_attributes(fitted):
     assert mean['a'] > mean['b']
 
 
+def test_scores_summary(fitted):
+    _, m = fitted
+    summ = m.scores_summary_
+    assert list(summ.index) == ['r2', 'mae', 'mse', 'rmse']
+    assert summ.loc['r2', 'mean'] == pytest.approx(m.score_)
+    assert (summ.loc['r2', 'ci_low'] < summ.loc['r2', 'mean'] <
+            summ.loc['r2', 'ci_high'])
+    # errors: lower is better, so the real model beats the baseline
+    assert summ.loc['rmse', 'mean'] < summ.loc['rmse', 'mean_shuffled']
+    assert (summ['p_value'] < 0.05).all()
+    assert m.cv_results_['rmse'].tolist() == pytest.approx(
+        np.sqrt(m.cv_results_['mse']).tolist())
+
+
+def test_effect_sizes_regression(fitted):
+    _, m = fitted
+    es = m.effect_sizes_.set_index('feature')
+    assert list(es.index) == ['a', 'b', 'c']
+    # shares of the total, intervals, null reference
+    assert es['effect_share'].sum() == pytest.approx(100.0)
+    assert (es['effect_ci_low'] < es['effect']).all()
+    assert (es['effect'] < es['effect_ci_high']).all()
+    assert es.loc['a', 'effect'] > es.loc['a', 'effect_shuffled']
+    assert es.loc['a', 'effect'] > es.loc['b', 'effect']
+    assert es['effect_rel_target_sd'].tolist() == pytest.approx(
+        (es['effect'] / m.target_std_).tolist())
+    # y = 2 a + c + noise: positive direction of a, about +2 per SD of a
+    assert es.loc['a', 'corr_x_shap'] > 0.8
+    assert es.loc['a', 'slope_per_sd'] == pytest.approx(2.0, abs=0.6)
+    # target-encoded predictor: direction undefined
+    assert np.isnan(es.loc['c', 'slope_per_sd'])
+    assert 'class' in m.effect_sizes_.columns
+
+
+def test_effect_sizes_single_split_has_no_interval(data):
+    m = _regressor(evaluation='TT').fit(data, data['y'], groups=data['pid'])
+    es = m.effect_sizes_
+    assert es['effect'].notna().all()
+    assert es['effect_ci_low'].isna().all()
+    assert es['slope_ci_low'].isna().all()
+    summ = m.scores_summary_
+    assert summ['p_value'].isna().all() and summ['ci_low'].isna().all()
+
+
 def test_output_dir_layout(fitted):
     d, _ = fitted
     assert sorted(p.name for p in d.iterdir()) == [
@@ -173,6 +217,9 @@ def test_load_restores_everything_exactly(fitted, data):
     assert NCVGBDTRegressor.load(d).score_ == m.score_
     pd.testing.assert_frame_equal(loaded.cv_results_, m.cv_results_)
     pd.testing.assert_frame_equal(loaded.shap_effects_, m.shap_effects_)
+    pd.testing.assert_frame_equal(loaded.scores_summary_, m.scores_summary_)
+    pd.testing.assert_frame_equal(loaded.effect_sizes_, m.effect_sizes_)
+    assert loaded.target_std_ == m.target_std_
     for a, b in zip(m.explanations_, loaded.explanations_):
         np.testing.assert_array_equal(a.values, b.values)
         np.testing.assert_array_equal(a.data, b.data)
@@ -242,6 +289,15 @@ def test_classifier_refit_with_string_labels(data, tmp_path):
     assert proba.shape == (10, 2)
     np.testing.assert_allclose(proba.sum(axis=1), 1.0)
     assert set(m.predict(data.head(10))) <= {'no', 'yes'}
+    cv = m.cv_results_
+    for col in ('acc', 'auc', 'logloss', 'brier', 'mcc', 'kappa', 'f1_macro',
+                'mcfadden', 'cox_snell', 'nagelkerke', 'tjur'):
+        assert col in cv.columns
+    assert cv['auc'].between(0, 1).all()
+    assert m.scores_summary_.loc['auc', 'mean'] > 0.5
+    es = m.effect_sizes_
+    assert set(es['class']) == {'yes'} and 'effect_rel_target_sd' not in es
+    pd.testing.assert_frame_equal(load_model(tmp_path).effect_sizes_, es)
     # binary effects are reported for the positive class only
     assert set(m.shap_effects_['class']) == {'yes'}
     loaded = load_model(tmp_path)

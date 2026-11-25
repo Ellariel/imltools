@@ -26,15 +26,20 @@ import joblib
 import numpy as np
 import pandas as pd
 from sklearn.base import BaseEstimator
+from scipy.stats import t as t_dist
 from sklearn.exceptions import NotFittedError
 
 from . import _json
 from .fitting import DEFAULT_SEED
+from .fitting import LOWER_IS_BETTER
+from .fitting import corrected_std
+from .fitting import corrected_ttest
 from .fitting import cross_validation
 from .fitting import fit_final
 from .fitting import get_explainations
 from .fitting import get_te_target_type
 from .fitting import get_test_groups
+from .fitting import metrics_for
 from .fitting import train_test_split
 
 FORMAT_VERSION = 1
@@ -315,6 +320,9 @@ class _NCVGBDTBase(BaseEstimator):
         self.objective_ = objective
         self.used_index_ = pos[mask]
         self.n_samples_used_ = int(mask.sum())
+        self.target_std_ = (
+            float(y[mask].std(ddof=1)) if objective == "regression" else None
+        )
         if classes is not None:
             self.classes_ = classes
         self._fingerprint = fingerprint
@@ -379,6 +387,7 @@ class _NCVGBDTBase(BaseEstimator):
             "classes": getattr(self, "classes_", None),
             "used_index": self.used_index_,
             "n_samples_used": self.n_samples_used_,
+            "target_std": self.target_std_,
         }
         _json.dump(manifest, out / MANIFEST)
 
@@ -467,25 +476,71 @@ class _NCVGBDTBase(BaseEstimator):
         """
         DataFrame, one row per outer fold: ``score`` (R2 or balanced
         accuracy) and ``score_shuffled`` (same for the shuffled-target
-        model), all metrics (``r2``, ``mae``, ``mse`` / ``acc``, each also
-        ``*_shuffled``), and the tuned hyperparameters (``param_*``).
+        model), all metrics, each also as ``*_shuffled``, and the tuned
+        hyperparameters (``param_*``).
+
+        Regression metrics: ``r2``, ``mae``, ``mse``, ``rmse``.
+        Classification metrics: ``acc`` (balanced accuracy), ``auc``,
+        ``logloss``, ``brier``, ``mcc``, ``kappa``, ``f1_macro``, the pseudo
+        R2 values ``mcfadden``, ``cox_snell``, ``nagelkerke`` and (binary
+        only) ``tjur``. See :func:`ncvgbdt.fitting.classification_metrics`
+        for the exact definitions (probability based metrics are
+        class-balanced).
         """
         self._check_fitted()
         r = self.results_
-        main = "r2" if self.objective_ == "regression" else "acc"
-        metrics = ("r2", "mae", "mse") if main == "r2" else ("acc",)
+        metrics = metrics_for(self.objective_)
+        main = metrics[0]
         rows = []
         for i, (bp, sc, ss) in enumerate(
             zip(r["best_params"], r["scores"], r["scores_sh"])
         ):
             row = {"fold": i, "score": sc[main], "score_shuffled": ss[main]}
             for m in metrics:
-                row[m] = sc[m]
-                row[m + "_shuffled"] = ss[m]
+                row[m] = sc.get(m, np.nan)
+                row[m + "_shuffled"] = ss.get(m, np.nan)
             for k, v in bp.items():
                 row["param_" + k.split("__")[-1]] = v
             rows.append(row)
         return pd.DataFrame(rows)
+
+    @property
+    def scores_summary_(self):
+        """
+        DataFrame, one row per metric, summarizing the outer folds:
+        ``mean``, ``sd``, an approximate 95 % interval (``ci_low``,
+        ``ci_high``), the mean and sd of the shuffled-target baseline and a
+        one-sided ``p_value`` of the real model against the baseline.
+
+        Interval and p value use the corrected resampled t-test (Nadeau &
+        Bengio, 2003) with a test/train ratio of 0.25 and are only
+        available for ``evaluation='CV'``. Folds of repeated CV are not
+        independent, so treat them as approximate (see README).
+        """
+        cv = self.cv_results_
+        corrected = self.task_["TYPE"] == "CV"
+        rows = {}
+        for m in metrics_for(self.objective_):
+            a = cv[m].to_numpy(float)
+            b = cv[m + "_shuffled"].to_numpy(float)
+            ok = np.isfinite(a) & np.isfinite(b)
+            row = {
+                "mean": pd.Series(a).mean(),
+                "sd": pd.Series(a).std(ddof=1),
+                "ci_low": np.nan,
+                "ci_high": np.nan,
+                "mean_shuffled": pd.Series(b).mean(),
+                "sd_shuffled": pd.Series(b).std(ddof=1),
+                "p_value": np.nan,
+            }
+            if corrected and ok.sum() >= 2:
+                half = t_dist.ppf(0.975, ok.sum() - 1) * corrected_std(a[ok])
+                row["ci_low"] = a[ok].mean() - half
+                row["ci_high"] = a[ok].mean() + half
+                diff = b[ok] - a[ok] if m in LOWER_IS_BETTER else a[ok] - b[ok]
+                row["p_value"] = corrected_ttest(diff)[1]
+            rows[m] = row
+        return pd.DataFrame(rows).T.rename_axis("metric")
 
     @property
     def score_(self):
@@ -545,8 +600,8 @@ class _NCVGBDTBase(BaseEstimator):
                     )
         return pd.DataFrame(rows)
 
-    def _effects(self, e):
-        """Mean |SHAP| as array (features, outputs)."""
+    def _main_values(self, e):
+        """Main-effect SHAP values as array (rows, features, outputs)."""
         v = np.asarray(e.values)
         if self.task_["SHAP_INTERACTIONS"]:
             v = v.sum(axis=2)
@@ -554,7 +609,127 @@ class _NCVGBDTBase(BaseEstimator):
             v = v[:, :, 1]
         if v.ndim == 2:
             v = v[:, :, None]
-        return np.abs(v).mean(axis=0)
+        return v
+
+    def _effects(self, e):
+        """Mean |SHAP| as array (features, outputs)."""
+        return np.abs(self._main_values(e)).mean(axis=0)
+
+    def _mean_ci(self, arr):
+        """
+        Mean over folds (axis 0) and approximate 95 % interval (corrected
+        resampled t-test variance; NaN for a single split or NaN cells).
+        """
+        k = arr.shape[0]
+        mean = np.full(arr.shape[1:], np.nan)
+        lo, hi = mean.copy(), mean.copy()
+        for cell in np.ndindex(*arr.shape[1:]):
+            vals = arr[(slice(None),) + cell]
+            finite = vals[np.isfinite(vals)]
+            if len(finite):
+                mean[cell] = finite.mean()
+            if self.task_["TYPE"] == "CV" and k >= 2 and len(finite) == k:
+                half = t_dist.ppf(0.975, k - 1) * corrected_std(finite)
+                lo[cell], hi[cell] = mean[cell] - half, mean[cell] + half
+        return mean, lo, hi
+
+    @property
+    def effect_sizes_(self):
+        """
+        DataFrame with effect sizes of the predictors (one row per feature
+        and, for multiclass targets, class; binary: positive class).
+
+        All quantities derive from the SHAP values of the outer test folds
+        (explained rows only) and are averaged over folds; intervals are
+        approximate 95 % intervals as in ``scores_summary_``. Units are
+        those of the SHAP values: target units (regression) or log-odds
+        (classification).
+
+        * ``effect``, ``effect_ci_low``, ``effect_ci_high``: mean absolute
+          SHAP value (magnitude of the predictor's contribution).
+        * ``effect_share``: ``effect`` as percent of the sum over predictors.
+        * ``effect_shuffled``: the same for the shuffled-target model, the
+          effect expected without any real relation (null reference).
+        * ``effect_rel_target_sd`` (regression only): ``effect`` divided by
+          the standard deviation of the target.
+        * ``slope_per_sd`` (+ interval): linear summary of the direction and
+          size of the effect: slope of the SHAP values on the predictor,
+          times the predictor's standard deviation, i.e. the average
+          change of the prediction per +1 SD of the predictor (a
+          standardized-beta-like summary of a possibly non-linear
+          function).
+        * ``corr_x_shap``: correlation between predictor values and their
+          SHAP values (sign = direction, size = linearity).
+
+        ``slope_per_sd`` and ``corr_x_shap`` are NaN for multi-category
+        predictors (``x_cat_mult_names``), which have no order.
+        """
+        self._check_fitted()
+        names = list(self.explanations_[0].feature_names)
+        nominal = set(self.task_["X_CAT_MULT_NAMES"])
+        classes = getattr(self, "classes_", None)
+        eff, eff_sh, share, slope, corr = [], [], [], [], []
+        for e, es in zip(self.explanations_, self.explanations_shuffled_):
+            v = self._main_values(e)
+            n, f, c = v.shape
+            a = np.abs(v).mean(axis=0)
+            eff.append(a)
+            eff_sh.append(self._effects(es))
+            total = a.sum(axis=0, keepdims=True)
+            share.append(np.where(total > 0, 100.0 * a / np.where(
+                total > 0, total, 1.0), np.nan))
+            sl = np.full((f, c), np.nan)
+            co = np.full((f, c), np.nan)
+            data = np.asarray(e.data)
+            for j, name in enumerate(names):
+                if name in nominal or n < 2:
+                    continue
+                x = data[:, j].astype(float)
+                sd = x.std(ddof=1)
+                if not np.isfinite(sd) or sd == 0:
+                    continue
+                for ci in range(c):
+                    sv = v[:, j, ci]
+                    cov = ((x - x.mean()) * (sv - sv.mean())).sum() / (n - 1)
+                    sl[j, ci] = cov / sd
+                    ssd = sv.std(ddof=1)
+                    if ssd > 0:
+                        co[j, ci] = cov / (sd * ssd)
+            slope.append(sl)
+            corr.append(co)
+        eff, eff_sh, share, slope, corr = (
+            np.stack(x) for x in (eff, eff_sh, share, slope, corr)
+        )
+        e_mean, e_lo, e_hi = self._mean_ci(eff)
+        s_mean, s_lo, s_hi = self._mean_ci(slope)
+        sh_mean = self._mean_ci(share)[0]
+        null_mean = self._mean_ci(eff_sh)[0]
+        c_mean = self._mean_ci(corr)[0]
+        rows = []
+        for j, name in enumerate(names):
+            for ci in range(e_mean.shape[1]):
+                label = None
+                if classes is not None:
+                    label = classes[1] if self.objective_ == "binary" else classes[ci]
+                row = {
+                    "feature": name,
+                    "class": label,
+                    "effect": e_mean[j, ci],
+                    "effect_ci_low": e_lo[j, ci],
+                    "effect_ci_high": e_hi[j, ci],
+                    "effect_share": sh_mean[j, ci],
+                    "effect_shuffled": null_mean[j, ci],
+                }
+                if self.target_std_:
+                    row["effect_rel_target_sd"] = e_mean[j, ci] / self.target_std_
+                row.update({
+                    "slope_per_sd": s_mean[j, ci],
+                    "slope_ci_low": s_lo[j, ci],
+                    "slope_ci_high": s_hi[j, ci],
+                    "corr_x_shap": c_mean[j, ci],
+                })
+                rows.append(row)
+        return pd.DataFrame(rows)
 
     # ------------------------------------------------- final model (refit)
     def _require_final(self):
@@ -665,6 +840,16 @@ class NCVGBDTRegressor(_NCVGBDTBase):
     ----------
     cv_results_ : DataFrame
         Per outer fold: scores, shuffled-target scores, tuned parameters.
+        Regression: R2, MAE, MSE, RMSE. Classification: balanced accuracy,
+        AUC, log loss, Brier score, MCC, kappa, macro F1 and the pseudo R2
+        values McFadden, Cox-Snell, Nagelkerke and (binary) Tjur.
+    scores_summary_ : DataFrame
+        Per metric: mean, sd, approximate 95 % interval, shuffled-target
+        baseline and one-sided corrected-t-test p value over the folds.
+    effect_sizes_ : DataFrame
+        Per predictor (and class): mean absolute SHAP effect with interval,
+        share of the total, null reference, effect relative to the target
+        sd (regression) and a standardized slope / correlation as direction.
     score_, score_shuffled_ : float
         Mean outer-fold score of the model and of the shuffled baseline.
     shap_effects_ : DataFrame
@@ -674,6 +859,8 @@ class NCVGBDTRegressor(_NCVGBDTBase):
     feature_names_in_ : ndarray of str
         Predictors in the order used.
     n_features_in_, n_samples_used_ : int
+    target_std_ : float or None
+        Standard deviation of the (used) target values, regression only.
     used_index_ : ndarray of int
         Positions in ``X`` of the complete-case rows that were used.
     target_name_ : str
@@ -780,6 +967,7 @@ def load_model(path, _expected=None):
     est.objective_ = manifest["objective"]
     est.used_index_ = manifest["used_index"]
     est.n_samples_used_ = manifest["n_samples_used"]
+    est.target_std_ = manifest["target_std"]
     if manifest["classes"] is not None:
         est.classes_ = manifest["classes"]
     est._fingerprint = manifest["fingerprint"]

@@ -17,8 +17,8 @@ matplotlib.use("Agg")
 from ncvgbdt import (NCVGBDTClassifier, NCVGBDTRegressor,  # noqa: E402
                      make_figures)
 from ncvgbdt.fitting import (  # noqa: E402
-    aggregate_shap_explanations, get_class_w, get_te_target_type,
-    get_test_groups)
+    aggregate_shap_explanations, classification_metrics, get_class_w,
+    get_te_target_type, get_test_groups, metrics_for)
 
 FAST = dict(n_rep_outer_cv=1, n_samples_inner_cv=10, n_samples_rs=5,
             max_samples_shap=10)
@@ -128,6 +128,67 @@ def test_validation_errors(data):
             X, np.zeros(len(X)))
 
 
+def _labels_and_proba(kind):
+    y = np.array([0] * 30 + [1] * 10)
+    if kind == 'perfect':
+        p1 = np.where(y == 1, 0.999, 0.001)
+    else:
+        p1 = np.full(len(y), 0.5)
+    return y, np.column_stack([1 - p1, p1])
+
+
+def test_classification_metrics_reference_points():
+    for kind, expected in (('perfect', 1.0), ('uniform', 0.0)):
+        y, proba = _labels_and_proba(kind)
+        m = classification_metrics(y, proba.argmax(1), proba, [0, 1],
+                                   get_class_w(y))
+        assert set(m) == set(metrics_for('binary'))
+        assert m['mcfadden'] == pytest.approx(expected, abs=2e-3)
+        assert m['nagelkerke'] == pytest.approx(expected, abs=2e-3)
+        assert m['tjur'] == pytest.approx(expected, abs=5e-3)
+        assert m['auc'] == pytest.approx(0.5 + expected / 2)
+    # a perfect classifier: errors vanish, a uniform one gets the null values
+    y, proba = _labels_and_proba('perfect')
+    m = classification_metrics(y, proba.argmax(1), proba, [0, 1],
+                               get_class_w(y))
+    assert m['acc'] == m['mcc'] == m['kappa'] == m['f1_macro'] == 1.0
+    assert m['brier'] < 1e-5 and m['logloss'] < 2e-3
+    y, proba = _labels_and_proba('uniform')
+    m = classification_metrics(y, proba.argmax(1), proba, [0, 1],
+                               get_class_w(y))
+    assert m['logloss'] == pytest.approx(np.log(2))
+    assert m['brier'] == pytest.approx(0.25)
+
+
+def test_classification_metrics_are_class_balanced():
+    """A model that always predicts the majority class gets balanced accuracy
+    0.5 and no better than null probability metrics."""
+    y = np.array([0] * 90 + [1] * 10)
+    proba = np.column_stack([np.full(100, 0.9), np.full(100, 0.1)])
+    m = classification_metrics(y, proba.argmax(1), proba, [0, 1],
+                               get_class_w(y))
+    assert m['acc'] == pytest.approx(0.5)
+    assert m['mcfadden'] <= 0           # worse than equal probabilities
+
+
+def test_classification_metrics_multiclass_and_string_labels():
+    rng = np.random.default_rng(0)
+    classes = np.array(['a', 'b', 'c'])
+    y = classes[rng.integers(0, 3, 90)]
+    proba = np.full((90, 3), 1 / 3)
+    m = classification_metrics(y, np.full(90, 'a'), proba, classes,
+                               get_class_w(y))
+    assert np.isnan(m['tjur'])
+    assert m['logloss'] == pytest.approx(np.log(3))
+    assert m['mcfadden'] == pytest.approx(0.0, abs=1e-12)
+    assert m['brier'] == pytest.approx(2 / 3)
+    assert m['auc'] == pytest.approx(0.5)
+    # unseen test label: probability metrics undefined, label metrics fine
+    m = classification_metrics(np.array(['z', 'a']), np.array(['a', 'a']),
+                               proba[:2], classes, {'z': 1.0, 'a': 1.0})
+    assert np.isnan(m['logloss']) and m['acc'] == 0.5
+
+
 # --- end-to-end runs --------------------------------------------------------
 
 @pytest.fixture(scope="module")
@@ -155,6 +216,21 @@ def test_multiclass_target_encoding_and_shap(multiclass_run):
     eff = model.shap_effects_
     assert set(eff['class']) == {0, 1, 2}
     assert set(eff['feature']) == {'a', 'b', 'c'}
+    # Metrics: everything but the binary-only Tjur R2
+    cv = model.cv_results_
+    for m in metrics_for('multiclass'):
+        assert m in cv.columns and m + '_shuffled' in cv.columns
+    assert 'tjur' not in cv.columns
+    assert cv['auc'].between(0, 1).all()
+    assert (cv['nagelkerke'] <= 1).all()
+    # Effect sizes per predictor and class; direction is undefined for the
+    # target-encoded predictor 'c'
+    es = model.effect_sizes_
+    assert len(es) == 3 * 3
+    assert es[es['feature'] == 'c']['slope_per_sd'].isna().all()
+    assert es[es['feature'] != 'c']['slope_per_sd'].notna().all()
+    for cls, grp in es.groupby('class'):
+        assert grp['effect_share'].sum() == pytest.approx(100.0)
 
 
 def test_multiclass_figures(multiclass_run):

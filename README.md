@@ -44,6 +44,8 @@ model.fit(df, df["mpg"], groups=None)  # groups: e.g. df['participant']
 
 model.cv_results_  # scores per outer fold, real vs. shuffled targets, tuned parameters
 model.shap_effects_  # mean |SHAP| per fold and predictor (long format)
+model.scores_summary_ # per metric: mean, sd, interval, shuffled baseline, p value
+model.effect_sizes_    # per predictor: effect, share, direction (slope per SD)
 make_figures(model)  # figures into results/mpg/figures
 
 model = load_model("results/mpg")  # later, in another session
@@ -154,15 +156,68 @@ results/mpg/
   the documentation; accuracies from those versions are not comparable.*
 - The confusion matrix is class-weighted, so its diagonal sums to the balanced
   accuracy.
+- **More metrics** (all out of sample, per outer test fold, also for the
+  shuffled-target model; `model.cv_results_`, summarized in
+  `model.scores_summary_`):
+  - Regression: R2, MAE, MSE, RMSE.
+  - Classification: balanced accuracy (`acc`), AUC (binary; multiclass: macro
+    one-vs-rest), log loss, Brier score, Matthews correlation (`mcc`), Cohen's
+    `kappa`, macro F1, and pseudo R2 values: McFadden (`1 - ll_model / ll_null`),
+    Cox-Snell, Nagelkerke (Cox-Snell scaled to a maximum of 1) and, for binary
+    targets, Tjur (mean predicted probability of the positive class among
+    positives minus among negatives).
+  - **Probability based metrics are class-balanced**: samples are weighted by
+    their class weight and the null model gives every class the same probability,
+    because the models are trained with balanced class weights and so their
+    probabilities reflect equal class priors. They are therefore not the same
+    numbers as an unweighted log loss or McFadden R2 on the raw class
+    frequencies. MCC and kappa use the labels unweighted; AUC is rank based.
+  - Pseudo R2 values are computed on test data, so they can be **negative** (worse
+    than the null model); they are not comparable to the R2 of a linear model
+    and have no variance-explained interpretation.
+  - **No AIC/BIC**: they need a likelihood and a parameter count, and a boosted
+    tree ensemble has no meaningful parameter count. The out-of-sample log loss
+    (equivalently the log-likelihood) from cross-validation is the proper
+    analogue for comparing models.
+  - The regression R2 uses the mean of the *test* fold as its baseline
+    (scikit-learn's `r2_score`), not the mean of the training data.
+
+### Effect sizes of predictors
+`model.effect_sizes_` has one row per predictor (and class, for multiclass
+targets), averaged over the outer folds, derived from the SHAP values of the test
+rows:
+
+- `effect`: mean absolute SHAP value, with an approximate 95 % interval
+  (`effect_ci_low`, `effect_ci_high`); `effect_share`: percent of the total over
+  predictors; `effect_shuffled`: the same for the shuffled-target model, i.e. the
+  effect that arises without any real relation (a null reference);
+  `effect_rel_target_sd` (regression): `effect` relative to the target's standard
+  deviation. Units: target units (regression) or log-odds (classification).
+- `slope_per_sd` (with interval) and `corr_x_shap`: **direction and a linear
+  summary** of the effect: the slope of the SHAP values on the predictor times
+  its standard deviation (about the change of the prediction per +1 SD of the
+  predictor), and the correlation between predictor values and SHAP values.
+  Both are NaN for multi-category predictors, which have no order.
+
+Caveats: a boosted-tree model has no coefficients, so these are *summaries of a
+possibly non-linear, interacting function*, not regression coefficients. A low
+correlation can mean a non-monotonic effect, not "no effect". The effect is a
+magnitude (non-negative); its interval is approximate (see below) and may reach
+below zero. For binary targets the positive class is reported (the other class is
+its mirror image). Effects of correlated predictors are shared between them (see
+"SHAP"). Compare `effect` with `effect_shuffled` rather than with zero.
 
 ### Shuffled-target baseline and p values
 - The baseline model reuses the hyperparameters tuned on the real data (it is not
   re-tuned on shuffled targets) and is refit on training targets that are shuffled
   **across rows, ignoring groups**. It estimates what the model does when there
   is no relationship between predictors and target.
-- Figure p values come from a **one-sided corrected resampled t-test** (Nadeau &
-  Bengio 2003) of the real model against the baseline over outer folds, assuming a
-  test/train size ratio of 0.25 (5-fold CV). Positive difference = real model
+- Figure p values and the `p_value`, `ci_low` and `ci_high` of
+  `model.scores_summary_` come from a **one-sided corrected resampled t-test**
+  (Nadeau & Bengio 2003) of the real model against the baseline over outer folds,
+  assuming a test/train size ratio of 0.25 (5-fold CV); for error metrics (MAE,
+  MSE, RMSE, log loss, Brier) a smaller value counts as better. Intervals of the
+  effect sizes use the same corrected variance. Positive difference = real model
   better; a real model worse than the baseline is not significant.
 - Folds of repeated CV are **not independent**, so these p values are
   approximate. They also shrink as `n_rep_outer_cv` grows although no new data

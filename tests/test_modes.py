@@ -200,3 +200,29 @@ def test_missing_values_are_dropped(data):
     model.fit(X, y, groups=data['pid'])
     assert model.n_samples_used_ == len(X) - 2
     assert 3 not in model.used_index_ and 7 not in model.used_index_
+
+
+def test_target_and_groups_by_column_name(data):
+    """Names and arrays give identical results; the target and the group
+    column are never used as predictors by default."""
+    sub = data[['pid', 'a', 'b', 'y']]
+    by_name = NCVGBDTRegressor(shap_interactions=False, **FAST).fit(
+        sub, 'y', groups='pid')
+    by_array = NCVGBDTRegressor(shap_interactions=False, **FAST).fit(
+        sub, sub['y'], groups=sub['pid'])
+    for m in (by_name, by_array):
+        assert list(m.feature_names_in_) == ['a', 'b']
+        assert m.target_name_ == 'y'
+    pd.testing.assert_frame_equal(by_name.cv_results_, by_array.cv_results_)
+
+
+def test_column_name_errors(data):
+    sub = data[['pid', 'a', 'b', 'y']]
+    with pytest.raises(KeyError, match="'nope' given as y"):
+        NCVGBDTRegressor(**FAST).fit(sub, 'nope')
+    with pytest.raises(KeyError, match="'nope' given as groups"):
+        NCVGBDTRegressor(**FAST).fit(sub, 'y', groups='nope')
+    with pytest.raises(ValueError, match="leak"):
+        NCVGBDTRegressor(x_con_names=['a', 'y'], **FAST).fit(sub, 'y')
+    with pytest.raises(ValueError, match="leak"):
+        NCVGBDTRegressor(x_con_names=['a', 'y'], **FAST).fit(sub, sub['y'])

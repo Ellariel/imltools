@@ -67,6 +67,21 @@ def _as_list(value, name):
     return value
 
 
+def _source_column(X, obj):
+    """
+    Name of the column of ``X`` that ``obj`` stands for: ``obj`` itself if it
+    is a string, the name of a Series that equals that column of ``X``,
+    otherwise None.
+    """
+    if isinstance(obj, str):
+        return obj
+    name = getattr(obj, "name", None)
+    if isinstance(obj, pd.Series) and name in X.columns:
+        if X[name].reset_index(drop=True).equals(obj.reset_index(drop=True)):
+            return name
+    return None
+
+
 def _fingerprint(x, y, g):
     """Hash of the data used for fitting (to recognize a resumable run)."""
     h = hashlib.sha256()
@@ -133,14 +148,19 @@ class _NCVGBDTBase(BaseEstimator):
         X : pandas.DataFrame (n_samples, n_columns)
             Predictors. Only the columns named in ``x_con_names``,
             ``x_cat_bin_names`` and ``x_cat_mult_names`` are used. If none
-            of these is given, all columns are used as continuous.
-        y : array-like (n_samples,)
-            Target. A pandas Series' name is used as target name in file
+            of these is given, all columns except the target and group
+            columns are used as continuous.
+        y : str or array-like (n_samples,)
+            Target: the name of a column of ``X``, or an array. A pandas
+            Series' name (or the column name) is used as target name in file
             and figure names (default 'y'). Regression: numeric.
-            Classification: any labels.
-        groups : array-like (n_samples,) or None, default None
-            Group of every row (e.g. participant). Groups are never split
-            across train and test sets. None: every row is its own group.
+            Classification: any labels. A target that is a column of ``X``
+            is never used as predictor by default; listing it explicitly as
+            predictor raises an error.
+        groups : str, array-like (n_samples,) or None, default None
+            Group of every row (e.g. participant): the name of a column of
+            ``X``, or an array. Groups are never split across train and
+            test sets. None: every row is its own group.
         test_idx : array-like of int or None, default None
             ``evaluation='TT'`` only: positions (0-based) in ``X`` of the
             test rows. None: random whole groups, see ``test_size``.
@@ -165,12 +185,28 @@ class _NCVGBDTBase(BaseEstimator):
         if not isinstance(X, pd.DataFrame):
             raise TypeError("X must be a pandas DataFrame.")
         n = len(X)
+        # Target and groups given as column names of X, or as arrays that are
+        # columns of X: remember which columns they are
+        y_col = _source_column(X, y)
+        g_col = None if groups is None else _source_column(X, groups)
+        for label, col, value in (("y", y_col, y), ("groups", g_col, groups)):
+            if isinstance(value, str) and col not in X.columns:
+                raise KeyError(f"Column {col!r} given as {label} is not in X.")
+        if isinstance(y, str):
+            y = X[y]
+        if isinstance(groups, str):
+            groups = X[groups]
         x_con = _as_list(self.x_con_names, "x_con_names")
         x_bin = _as_list(self.x_cat_bin_names, "x_cat_bin_names")
         x_mult = _as_list(self.x_cat_mult_names, "x_cat_mult_names")
         if not (x_con or x_bin or x_mult):
-            x_con = list(X.columns)
+            # All columns except the target and the group column
+            x_con = [c for c in X.columns if c not in (y_col, g_col)]
         x_names = x_con + x_bin + x_mult
+        if y_col is not None and y_col in x_names:
+            raise ValueError(
+                f"The target {y_col!r} is also used as a predictor (leak)."
+            )
         if len(set(x_names)) != len(x_names):
             raise ValueError("A predictor is listed more than once.")
         missing = [c for c in x_names if c not in X.columns]

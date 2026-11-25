@@ -51,7 +51,9 @@ model = load_model("results/mpg")  # later, in another session
 
 Use `NCVGBDTClassifier` for categorical targets (two classes: binary, more:
 multiclass; any labels). `fit(X, y, groups=None, test_idx=None)` follows the
-scikit-learn convention; the estimators support `get_params`, `set_params` and
+scikit-learn convention, and `y` and `groups` may also be column names of `X`
+(`fit(df, 'mpg', groups='pid')`; the target and group columns are then never
+used as predictors by default); the estimators support `get_params`, `set_params` and
 `clone`. See [example.py](example.py) (mtcars). Every parameter, attribute and
 method with options and defaults is documented in the docstrings, e.g.
 `help(ncvgbdt.NCVGBDTRegressor)` and `help(ncvgbdt.make_figures)`.

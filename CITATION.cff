@@ -1,0 +1,26 @@
+cff-version: 1.2.0
+message: >-
+  If you use "ncvgbdt" please cite it with the metadata below. It is based
+  on the code and method of David Steyrl (https://github.com/univiemops/iml);
+  please also acknowledge that work.
+type: software
+title: "Interpretable Machine Learning Toolbox (imltools)"
+abstract: >-
+  Scikit-learn style estimators for tabular regression, binary and multiclass
+  problems with grouped observations: LightGBM models evaluated with repeated
+  group-wise nested cross-validation, compared against a shuffled-target
+  baseline, and explained with SHAP values, effect sizes and figures. Derived
+  from the iml scripts by David Steyrl.
+authors:
+  - family-names: Valko
+    given-names: Danila
+version: 0.2.0
+license: MIT
+repository-code: "https://github.com/ellariel/imltools"
+keywords:
+  - interpretable machine learning
+  - gradient boosted decision trees
+  - LightGBM
+  - SHAP
+  - nested cross-validation
+  - scikit-learn

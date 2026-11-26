@@ -8,12 +8,10 @@ binary and multiclass targets, optionally with grouped observations (e.g. severa
 rows per participant).
 
 This code is a reused version with modifications by Danila Valko
-(danila.valko[at]proton.me) of Dr. David Steyrl's codebase (david.steyrl[at]gmail.com).
-Source code and description: https://github.com/univiemops/iml, one example here:
-https://doi.org/10.31219/osf.io/um69t. The SHAP project: https://github.com/shap/shap.
+(danila.valko[at]proton.me) of David Steyrl's codebase: https://github.com/univiemops/iml and the SHAP project: https://github.com/shap/shap.
 
-You can cite this tool by mentioning one of Dr. Steyrl's works, e.g.
-https://doi.org/10.1038/s41598-024-65088-z or https://doi.org/10.1371/journal.pone.0304285
+The citation metadata of this package is in
+[CITATION.cff](CITATION.cff); GitHub offers it under "Cite this repository".
 
 ## Install
 
@@ -31,13 +29,19 @@ scikit-learn 1.5 / lightgbm 4.5) and with current releases (numpy 2, shap 0.54,
 ## Quick start
 
 ```python
+import pandas as pd
 from ncvgbdt import NCVGBDTRegressor, make_figures, load_model
+
+# mtcars (in tests/data): 32 rows, only a smoke test, estimates are noisy
+df = pd.read_csv("tests/data/mtcars.csv", index_col="model")
 
 model = NCVGBDTRegressor(
     x_con_names=["wt"],  # continuous predictors
     x_cat_bin_names=["vs"],  # binary predictors, coded 0/1
     x_cat_mult_names=["gear"],  # >2 categories, target encoded
     evaluation="CV",  # 'CV' | 'TT'
+    n_rep_outer_cv=1,  # quick demo; the default is 10 repetitions
+    n_samples_rs=10,  # quick demo; the default is 100 random search draws
     output_dir="results/mpg",  # everything is stored here as JSON
 )
 model.fit(df, df["mpg"], groups=None)  # groups: e.g. df['participant']
@@ -56,7 +60,7 @@ multiclass; any labels). `fit(X, y, groups=None, test_idx=None)` follows the
 scikit-learn convention, and `y` and `groups` may also be column names of `X`
 (`fit(df, 'mpg', groups='pid')`; the target and group columns are then never
 used as predictors by default); the estimators support `get_params`, `set_params` and
-`clone`. See [example.py](example.py) (mtcars). Every parameter, attribute and
+`clone`. Every parameter, attribute and
 method with options and defaults is documented in the docstrings, e.g.
 `help(ncvgbdt.NCVGBDTRegressor)` and `help(ncvgbdt.make_figures)`.
 
@@ -309,7 +313,7 @@ and aggregated over target-encoded columns).
 ### Form and interface
 - **Package instead of scripts.** Upstream is a set of scripts configured by
   editing `main()` (Excel input, log files, pickle output). Here: an installable
-  package (`src` layout, `pyproject.toml`, uv) with scikit-learn style estimators
+  package (`ncvgbdt/` folder, `pyproject.toml`, uv) with scikit-learn style estimators
   (`NCVGBDTRegressor`, `NCVGBDTClassifier`), `fit(X, y, groups)`, fitted
   attributes, `get_params` / `clone`, `y` and `groups` also by column name.
 - **Storage.** JSON per outer fold plus a manifest (settings, library versions,
@@ -386,7 +390,7 @@ give identical results (tested).
 uv run pytest            # about 5 minutes
 ```
 
-`tests/test_example.py` re-runs the mtcars example and compares with reference
+`tests/test_example.py` re-runs the mtcars example (`tests/data/mtcars.csv`) and compares with reference
 values (one set per numpy major version, with a small tolerance) and checks exact
 reproducibility; `tests/test_modes.py` covers classification, grouped
 train-test splits, interactions, validation and helpers; `tests/test_estimator.py`

@@ -1,4 +1,5 @@
-"""Regression test based on example.py (mtcars, regression, repeated CV).
+"""Regression test based on the README quick start (mtcars, regression,
+repeated CV).
 
 Checks that (1) the analysis is reproducible for a fixed seed, (2) it matches
 reference values, and (3) figures are produced.
@@ -8,7 +9,6 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 import pytest
-import statsmodels.api as sm
 
 import matplotlib
 matplotlib.use("Agg")
@@ -16,6 +16,10 @@ matplotlib.use("Agg")
 from ncvgbdt import NCVGBDTRegressor, make_figures  # noqa: E402
 
 SEED = 3141592
+
+# mtcars (Motor Trend, 1974; as distributed with R): 32 rows, kept as a CSV
+# file so that no extra package is needed to load it.
+MTCARS = Path(__file__).parent / "data" / "mtcars.csv"
 
 # Reference values produced with seed=3141592: R2 per outer fold and mean
 # absolute SHAP value per feature of the first fold. Library versions change
@@ -40,7 +44,7 @@ RTOL, ATOL = 1e-3, 1e-4
 
 
 def _fit(results_dir=None, seed=SEED):
-    df = pd.DataFrame(sm.datasets.get_rdataset("mtcars", "datasets", cache=True).data)
+    df = pd.read_csv(MTCARS, index_col="model")
     model = NCVGBDTRegressor(x_con_names=['wt'],
                              x_cat_bin_names=['vs'],
                              x_cat_mult_names=['gear'],

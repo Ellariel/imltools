@@ -14,13 +14,21 @@ Typical use::
     model = load_model('out')
 
 Estimators live in :mod:`ncvgbdt.estimator`, building blocks in
-:mod:`ncvgbdt.fitting`, figures in :mod:`ncvgbdt.plotting`.
+:mod:`ncvgbdt.fitting`, figures in :mod:`ncvgbdt.plotting` (number formatting
+in :mod:`ncvgbdt.format`).
 """
+
+from importlib.metadata import PackageNotFoundError, version
 
 from .estimator import NCVGBDTClassifier
 from .estimator import NCVGBDTRegressor
 from .estimator import load_model
 from .plotting import make_figures
 
+try:
+    __version__ = version('imltools')  # name of the installed distribution
+except PackageNotFoundError:  # running from a source tree that is not installed
+    __version__ = 'unknown'
+
 __all__ = ['NCVGBDTRegressor', 'NCVGBDTClassifier', 'load_model',
-           'make_figures']
+           'make_figures', '__version__']

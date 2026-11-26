@@ -43,6 +43,12 @@ def _regressor(out=None, **kw):
 
 
 @pytest.fixture(scope="module")
+def with_inter(data):
+    """Regressor with SHAP interaction values."""
+    return _regressor(shap_interactions=True).fit(data, 'y', groups=data['pid'])
+
+
+@pytest.fixture(scope="module")
 def fitted(data, tmp_path_factory):
     d = tmp_path_factory.mktemp("fitted")
     model = _regressor(d, refit=True).fit(data, data['y'],
@@ -185,12 +191,104 @@ def test_effect_sizes_regression(fitted):
     assert 'class' in m.effect_sizes_.columns
 
 
+def test_effect_size_p_values_and_corrections(fitted):
+    _, m = fitted
+    es = m.effect_sizes_.set_index('feature')
+    cols = ['p_value', 'p_value_bonferroni', 'p_value_holm', 'p_value_fdr_bh']
+    assert es[cols].notna().all().all() and es[cols].stack().between(0, 1).all()
+    assert (es['p_value_bonferroni'] >= es['p_value_holm'] - 1e-12).all()
+    assert (es['p_value_holm'] >= es['p_value'] - 1e-12).all()
+    assert (es['p_value_fdr_bh'] <= es['p_value_bonferroni'] + 1e-12).all()
+    # the informative predictor is clearly more significant than pure noise
+    assert es.loc['a', 'p_value'] < es.loc['b', 'p_value']
+    # Bonferroni multiplies by the number of predictors
+    np.testing.assert_allclose(
+        es['p_value_bonferroni'], np.minimum(es['p_value'] * 3, 1.0))
+    # the p values follow from the per-fold effects in shap_effects_
+    from ncvgbdt.fitting import corrected_ttest
+    eff = m.shap_effects_.pivot(index='fold', columns='feature', values='effect')
+    null = m.shap_effects_.pivot(index='fold', columns='feature',
+                                 values='effect_shuffled')
+    for name in es.index:
+        assert es.loc[name, 'p_value'] == pytest.approx(
+            corrected_ttest((eff[name] - null[name]).to_numpy())[1])
+
+
+def test_shap_values_table_and_explanation(fitted):
+    _, m = fitted
+    sv = m.shap_values_
+    n_rows = sum(len(e.values) for e in m.explanations_)
+    assert len(sv) == n_rows * 3
+    assert list(sv.columns) == ['fold', 'row', 'class', 'feature',
+                                'feature_value', 'shap_value']
+    assert sv['feature_value'].dtype == float
+    # the effects are the mean absolute SHAP values of this table
+    eff = (sv.assign(abs_shap=sv['shap_value'].abs())
+           .groupby(['fold', 'feature'])['abs_shap'].mean())
+    table = m.shap_effects_.set_index(['fold', 'feature'])['effect']
+    np.testing.assert_allclose(eff.loc[table.index], table)
+    # pooled Explanation: same numbers, rows of the folds one after another
+    ex = m.shap_explanation()
+    assert ex.values.shape == (n_rows, 3) and ex.data.shape == (n_rows, 3)
+    wide = sv.pivot_table(index=['fold', 'row'], columns='feature',
+                          values='shap_value')[list(ex.feature_names)]
+    np.testing.assert_allclose(ex.values, wide.to_numpy())
+    shuffled = m.shap_explanation(shuffled=True)
+    assert shuffled.values.shape == ex.values.shape
+    assert not np.allclose(shuffled.values, ex.values)
+    with pytest.raises(ValueError, match="classification"):
+        m.shap_explanation(class_=1)
+    with pytest.raises(ValueError, match="shap_interactions"):
+        m.shap_explanation(interactions=True)
+
+
+def test_interaction_effects_need_interactions(fitted):
+    _, m = fitted
+    assert not hasattr(m, 'interaction_effects_')
+    with pytest.raises(AttributeError, match="shap_interactions=True"):
+        m.interaction_effects_
+
+
+def test_interaction_effects_table(with_inter):
+    m = with_inter
+    ie = m.interaction_effects_
+    assert len(ie) == 9 and set(ie['feature_a']) == {'a', 'b', 'c'}
+    for col in ('effect', 'effect_shuffled', 'p_value', 'p_value_bonferroni',
+                'p_value_holm', 'p_value_fdr_bh'):
+        assert col in ie.columns
+    wide = ie.pivot(index='feature_a', columns='feature_b', values='effect')
+    np.testing.assert_allclose(wide.to_numpy(), wide.to_numpy().T, rtol=1e-6,
+                               atol=1e-8)                     # symmetric
+    # the family is the whole 3 x 3 matrix
+    np.testing.assert_allclose(ie['p_value_bonferroni'],
+                               np.minimum(ie['p_value'] * 9, 1.0))
+    assert m.shap_explanation(interactions=True).values.shape[1:] == (3, 3)
+    # effect_sizes_ and shap_effects_ come from the same per-fold effects
+    es = m.effect_sizes_.set_index('feature')['effect']
+    plain = m.shap_effects_.groupby('feature')['effect'].mean()
+    np.testing.assert_allclose(es[plain.index], plain)
+
+
+def test_new_tables_survive_save_and_load(with_inter, tmp_path):
+    with_inter.save(tmp_path / 'saved')
+    loaded = load_model(tmp_path / 'saved')
+    pd.testing.assert_frame_equal(loaded.interaction_effects_,
+                                  with_inter.interaction_effects_)
+    pd.testing.assert_frame_equal(loaded.shap_values_, with_inter.shap_values_)
+    pd.testing.assert_frame_equal(loaded.effect_sizes_, with_inter.effect_sizes_)
+    np.testing.assert_allclose(loaded.shap_explanation().values,
+                               with_inter.shap_explanation().values)
+
+
 def test_effect_sizes_single_split_has_no_interval(data):
     m = _regressor(evaluation='TT').fit(data, data['y'], groups=data['pid'])
     es = m.effect_sizes_
     assert es['effect'].notna().all()
     assert es['effect_ci_low'].isna().all()
     assert es['slope_ci_low'].isna().all()
+    # a single split has no variance over folds: no p values
+    for col in ('p_value', 'p_value_bonferroni', 'p_value_holm', 'p_value_fdr_bh'):
+        assert es[col].isna().all()
     summ = m.scores_summary_
     assert summ['p_value'].isna().all() and summ['ci_low'].isna().all()
 

@@ -16,7 +16,8 @@ matplotlib.use("Agg")
 from ncvgbdt import (NCVGBDTClassifier, NCVGBDTRegressor,  # noqa: E402
                      load_model, make_figures)
 from ncvgbdt.fitting import (  # noqa: E402
-    aggregate_shap_explanations, classification_metrics, get_class_w,
+    CORRECTIONS, adjust_pvalues, aggregate_shap_explanations,
+    classification_metrics, corrected_ttest, effect_pvalues, get_class_w,
     get_te_target_type, get_test_groups, metrics_for)
 
 FAST = dict(n_rep_outer_cv=1, n_samples_inner_cv=10, n_samples_rs=5,
@@ -61,6 +62,64 @@ def test_figure_file_names():
     long_a = _file_stem('z' * 300 + 'a')
     long_b = _file_stem('z' * 300 + 'b')
     assert len(long_a) <= 120 and long_a != long_b
+
+
+def test_adjust_pvalues_known_values():
+    """Hand-computed textbook values."""
+    p = [0.01, 0.04, 0.03, 0.005]
+    np.testing.assert_allclose(adjust_pvalues(p, None), p)
+    np.testing.assert_allclose(adjust_pvalues(p, "bonferroni"),
+                               [0.04, 0.16, 0.12, 0.02])
+    # Holm: sorted 0.005, 0.01, 0.03, 0.04 -> x4, x3, x2, x1, then cumulative max
+    np.testing.assert_allclose(adjust_pvalues(p, "holm"),
+                               [0.03, 0.06, 0.06, 0.02])
+    # Benjamini-Hochberg: p * m / rank, then cumulative min from the largest
+    np.testing.assert_allclose(adjust_pvalues(p, "fdr_bh"),
+                               [0.02, 0.04, 0.04, 0.02])
+    # capped at 1
+    assert adjust_pvalues([0.6, 0.7], "bonferroni").tolist() == [1.0, 1.0]
+
+
+def test_adjust_pvalues_properties():
+    rng = np.random.default_rng(0)
+    p = rng.uniform(size=(6, 5)) ** 2
+    bonf, holm, fdr = (adjust_pvalues(p, m) for m in CORRECTIONS)
+    assert bonf.shape == holm.shape == fdr.shape == p.shape   # any shape
+    for adj in (bonf, holm, fdr):
+        assert ((adj >= p - 1e-12) & (adj <= 1)).all()
+    assert (holm <= bonf + 1e-12).all()      # Holm never worse than Bonferroni
+    assert (fdr <= bonf + 1e-12).all()
+    # adjusted p values keep the order of the raw ones
+    order = np.argsort(p.ravel(), kind="stable")
+    for adj in (holm, fdr):
+        assert (np.diff(adj.ravel()[order]) >= -1e-12).all()
+
+
+def test_adjust_pvalues_nan_and_errors():
+    p = np.array([0.01, np.nan, 0.04])
+    out = adjust_pvalues(p, "bonferroni")      # family size 2, NaN stays NaN
+    np.testing.assert_allclose(out, [0.02, np.nan, 0.08])
+    assert np.isnan(adjust_pvalues([np.nan, np.nan], "holm")).all()
+    with pytest.raises(ValueError, match="method"):
+        adjust_pvalues([0.1], "nope")
+    assert p[1] != p[1] and p[0] == 0.01      # input is not modified
+
+
+def test_effect_pvalues():
+    rng = np.random.default_rng(1)
+    real = rng.normal(1.0, 0.1, size=(5, 3, 2))
+    shuf = rng.normal(0.2, 0.1, size=(5, 3, 2))
+    p = effect_pvalues(real, shuf)
+    assert p.shape == (3, 2) and (p < 0.01).all()
+    assert p[1, 0] == corrected_ttest(real[:, 1, 0] - shuf[:, 1, 0])[1]
+    # the shuffled model is better -> not significant (one-sided)
+    assert (effect_pvalues(shuf, real) > 0.99).all()
+    # a single split has no variance over folds
+    assert np.isnan(effect_pvalues(real[:1], shuf[:1])).all()
+    # non-finite values give NaN for that cell only
+    real[2, 0, 0] = np.nan
+    q = effect_pvalues(real, shuf)
+    assert np.isnan(q[0, 0]) and np.isfinite(q[1:]).all()
 
 
 def test_te_target_type():
@@ -244,6 +303,20 @@ def test_multiclass_target_encoding_and_shap(multiclass_run):
     assert es[es['feature'] != 'c']['slope_per_sd'].notna().all()
     for cls, grp in es.groupby('class'):
         assert grp['effect_share'].sum() == pytest.approx(100.0)
+    # p values, per class, with the three adjustments
+    for col in ('p_value', 'p_value_bonferroni', 'p_value_holm',
+                'p_value_fdr_bh'):
+        assert es[col].between(0, 1).all()
+    assert (es['p_value_holm'] >= es['p_value'] - 1e-12).all()
+    assert (es['p_value_bonferroni'] >= es['p_value_holm'] - 1e-12).all()
+    # pooled SHAP values per class
+    ex = model.shap_explanation(class_=1)
+    assert ex.values.shape[1] == 3 and ex.values.shape[0] == model.shap_values_[
+        model.shap_values_['class'] == 1].shape[0] // 3
+    with pytest.raises(ValueError, match="required for multiclass"):
+        model.shap_explanation()
+    with pytest.raises(ValueError, match="Unknown class_"):
+        model.shap_explanation(class_=99)
 
 
 def test_multiclass_figures(multiclass_run):
@@ -363,6 +436,18 @@ def test_multiclass_shap_interactions(data, tmp_path):
     b = main.shap_effects_.set_index(keys)
     np.testing.assert_allclose(a['effect'], b['effect'], atol=1e-8)
     assert len(inter.effect_sizes_) == 3 * 3
+    # interaction effects: all cells of the 3 x 3 matrix, per class
+    ie = inter.interaction_effects_
+    assert len(ie) == 3 * 3 * 3 and set(ie['class']) == {0, 1, 2}
+    assert ie['p_value_holm'].between(0, 1).all()
+    # pooled interaction values per class, and their sum = main values
+    ex_i = inter.shap_explanation(class_=2, interactions=True)
+    ex_m = inter.shap_explanation(class_=2)
+    assert ex_i.values.shape[1:] == (3, 3)
+    np.testing.assert_allclose(ex_i.values.sum(axis=2), ex_m.values)
+    # ... which equal the main values of the run without interactions
+    np.testing.assert_allclose(ex_m.values,
+                               main.shap_explanation(class_=2).values, atol=1e-8)
     # one set of SHAP figures per class
     figs = make_figures(inter, plot_type='all', output_dir=tmp_path / 'figs')
     for label in inter.classes_:

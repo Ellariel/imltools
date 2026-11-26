@@ -27,8 +27,14 @@ from shap.plots import beeswarm
 from shap.plots import scatter
 from sklearn.metrics import confusion_matrix
 
+from .fitting import CORRECTIONS
+from .fitting import adjust_pvalues
 from .fitting import corrected_std  # noqa: F401
 from .fitting import corrected_ttest
+from .fitting import effect_pvalues
+from .fitting import get_interaction_effects
+from .fitting import get_shap_effects
+from .fitting import get_shap_values
 
 from .format import format_p, format_r, get_stars
 
@@ -137,11 +143,6 @@ def _file_stem(name, max_len=120):
         digest = hashlib.md5(name.encode("utf-8")).hexdigest()[:8]
         stem = stem[: max_len - 9] + "_" + digest
     return stem
-
-
-def _total_compute_time(explainations):
-    """Sum of the SHAP compute times (missing times count as 0)."""
-    return float(np.sum([k.compute_time or 0 for k in explainations]))
 
 
 def print_parameter_distributions(task, results, figs):
@@ -728,86 +729,6 @@ def print_classification_violin(task, results, figs):
     return fig
 
 
-def get_shap_effects(task, explainations, c_class=-1):
-    """
-    Get SHAP based global effects.
-
-    Parameters
-    ----------
-    task : dictionary
-        Dictionary holding the task describtion variables.
-    explainations : list of shap explaination objects
-        SHAP explaination holding the results of the ml analyses.
-    c_class : integer
-        Current class for slicing.
-
-    Returns
-    -------
-    shap_effects : list
-        SHAP effects.
-    shap_base : float
-        Base value corresponds to expected value of the predictor.
-    """
-
-    # Get shap effects --------------------------------------------------------
-    # Case 1: no interaction and regression
-    if not task["SHAP_INTERACTIONS"] and task["OBJECTIVE"] == "regression":
-        # SHAP effects
-        shap_effects = [np.mean(np.abs(k.values), axis=0) for k in explainations]
-        # Base value
-        base = np.mean(np.hstack([k.base_values for k in explainations]))
-    # Case 2: interaction and regression
-    elif task["SHAP_INTERACTIONS"] and task["OBJECTIVE"] == "regression":
-        # Get SHAP effects
-        shap_effects = [
-            np.mean(np.abs(np.sum(k.values, axis=2)), axis=0) for k in explainations
-        ]
-        # Base value
-        base = np.mean(np.hstack([k.base_values for k in explainations]))
-    # Case 3: no interaction and binary
-    elif not task["SHAP_INTERACTIONS"] and task["OBJECTIVE"] == "binary":
-        # SHAP effects
-        shap_effects = [
-            np.mean(np.abs(k.values[:, :, c_class]), axis=0) for k in explainations
-        ]
-        # Base value
-        base = np.mean(np.hstack([k[:, :, c_class].base_values for k in explainations]))
-    # Case 4: interaction and binary
-    elif task["SHAP_INTERACTIONS"] and task["OBJECTIVE"] == "binary":
-        # Get SHAP effects
-        shap_effects = [
-            np.mean(np.abs(np.sum(k.values, axis=2)), axis=0) for k in explainations
-        ]
-        # Base value
-        base = np.mean(np.hstack([k.base_values for k in explainations]))
-    # Case 5: no interaction and multiclass
-    elif not task["SHAP_INTERACTIONS"] and task["OBJECTIVE"] == "multiclass":
-        # SHAP effects
-        shap_effects = [
-            np.mean(np.abs(k.values[:, :, c_class]), axis=0) for k in explainations
-        ]
-        # Base value
-        base = np.mean(np.hstack([k[:, :, c_class].base_values for k in explainations]))
-    # Case 6: interaction and multiclass
-    elif task["SHAP_INTERACTIONS"] and task["OBJECTIVE"] == "multiclass":
-        # Get SHAP effects
-        shap_effects = [
-            np.mean(np.abs(np.sum(k.values, axis=2)), axis=0) for k in explainations
-        ]
-        # Base value
-        base = np.mean(np.hstack([k.base_values for k in explainations]))
-    # Case else
-    else:
-        # Raise error
-        raise ValueError("Unsupported task.")
-
-    # Make SHAP effects dataframe
-    shap_effects_df = pd.DataFrame(shap_effects, columns=task["x_names"])
-
-    # Return shap effects -----------------------------------------------------
-    return shap_effects_df, base
-
-
 def print_shap_effects(task, results, figs):
     """
     Print SHAP based global effects.
@@ -912,25 +833,16 @@ def print_shap_effects(task, results, figs):
         # Set title
         ax.set_title(title_str, fontsize=10)
 
-        # Compute SHAP effect p values ----------------------------------------
-        # Init p value list
-        pval = []
-        # Iterate over predictors
-        for pred_name, pred_data in shap_effects_df.items():
-            # Get current p value
-            _, c_pval = corrected_ttest(
-                pred_data.to_numpy() - shap_effects_sh_df[pred_name].to_numpy()
-            )
-            # Add to pval list
-            pval.append(np.around(c_pval, decimals=3))
-        # Make pval series
-        pval_se = pd.Series(data=pval, index=task["x_names"])
-        # Multiple comparison correction
-        if task["MCC"]:
-            # Multiply p value by number of tests
-            pval_se = pval_se * x_names_count
-            # Set p values > 1 to 1
-            pval_se = pval_se.clip(upper=1)
+        # Compute SHAP effect p values (shared with the estimator) ----------------
+        pval_se = pd.Series(
+            adjust_pvalues(
+                effect_pvalues(
+                    shap_effects_df.to_numpy(), shap_effects_sh_df.to_numpy()
+                ),
+                task["MCC"],
+            ),
+            index=task["x_names"],
+        )
 
         # Add SHAP effect values and p values as text -------------------------
         # Loop over values
@@ -1107,173 +1019,6 @@ def print_shap_effects_distribution(task, results, figs):
 
     # Return None -------------------------------------------------------------
     return fig
-
-
-def get_shap_values(task, explainations, c_class=-1):
-    """
-    Get SHAP values.
-
-    Parameters
-    ----------
-    task : dictionary
-        Dictionary holding the task describtion variables.
-    explainations : list of shap explaination objects
-        SHAP explaination holding the results of the ml analyses.
-    c_class : integer
-        Current class for slicing.
-
-    Returns
-    -------
-    shap_explainations : shap explaination object
-        Explaination object with SHAP values.
-    shap_base : float
-        Base value corresponds to expected value of the predictor.
-    """
-
-    # Get shap effects --------------------------------------------------------
-    # Case 1: no interaction and regression
-    if not task["SHAP_INTERACTIONS"] and task["OBJECTIVE"] == "regression":
-        # Explainer object
-        shap_explainations = Explanation(
-            np.vstack([k.values for k in explainations]),
-            base_values=np.hstack([k.base_values for k in explainations]),
-            data=np.vstack([k.data for k in explainations]),
-            display_data=None,
-            instance_names=None,
-            feature_names=explainations[0].feature_names,
-            output_names=None,
-            output_indexes=None,
-            lower_bounds=None,
-            upper_bounds=None,
-            error_std=None,
-            main_effects=None,
-            hierarchical_values=None,
-            clustering=None,
-            compute_time=_total_compute_time(explainations),
-        )
-        # Base value
-        base = np.mean(np.hstack([k.base_values for k in explainations]))
-    # Case 2: interaction and regression
-    elif task["SHAP_INTERACTIONS"] and task["OBJECTIVE"] == "regression":
-        # Explainer object
-        shap_explainations = Explanation(
-            np.vstack([k.values for k in explainations]),
-            base_values=np.hstack([k.base_values for k in explainations]),
-            data=np.vstack([k.data for k in explainations]),
-            display_data=None,
-            instance_names=None,
-            feature_names=explainations[0].feature_names,
-            output_names=None,
-            output_indexes=None,
-            lower_bounds=None,
-            upper_bounds=None,
-            error_std=None,
-            main_effects=None,
-            hierarchical_values=None,
-            clustering=None,
-            compute_time=_total_compute_time(explainations),
-        )
-        # Base value
-        base = np.mean(np.hstack([k.base_values for k in explainations]))
-    # Case 3: no interaction and binary
-    elif not task["SHAP_INTERACTIONS"] and task["OBJECTIVE"] == "binary":
-        # Explainer object
-        shap_explainations = Explanation(
-            np.vstack([k[:, :, c_class].values for k in explainations]),
-            base_values=np.hstack(
-                [k[:, :, c_class].base_values for k in explainations]
-            ),
-            data=np.vstack([k[:, :, c_class].data for k in explainations]),
-            display_data=None,
-            instance_names=None,
-            feature_names=explainations[0].feature_names,
-            output_names=None,
-            output_indexes=None,
-            lower_bounds=None,
-            upper_bounds=None,
-            error_std=None,
-            main_effects=None,
-            hierarchical_values=None,
-            clustering=None,
-            compute_time=_total_compute_time(explainations),
-        )
-        # Base value
-        base = np.mean(np.hstack([k[:, :, c_class].base_values for k in explainations]))
-    # Case 4: interaction and binary
-    elif task["SHAP_INTERACTIONS"] and task["OBJECTIVE"] == "binary":
-        # Explainer object
-        shap_explainations = Explanation(
-            np.vstack([k.values for k in explainations]),
-            base_values=np.hstack([k.base_values for k in explainations]),
-            data=np.vstack([k.data for k in explainations]),
-            display_data=None,
-            instance_names=None,
-            feature_names=explainations[0].feature_names,
-            output_names=None,
-            output_indexes=None,
-            lower_bounds=None,
-            upper_bounds=None,
-            error_std=None,
-            main_effects=None,
-            hierarchical_values=None,
-            clustering=None,
-            compute_time=_total_compute_time(explainations),
-        )
-        # Base value
-        base = np.mean(np.hstack([k.base_values for k in explainations]))
-    # Case 5: no interaction and multiclass
-    elif not task["SHAP_INTERACTIONS"] and task["OBJECTIVE"] == "multiclass":
-        # Explainer object
-        shap_explainations = Explanation(
-            np.vstack([k[:, :, c_class].values for k in explainations]),
-            base_values=np.hstack(
-                [k[:, :, c_class].base_values for k in explainations]
-            ),
-            data=np.vstack([k[:, :, c_class].data for k in explainations]),
-            display_data=None,
-            instance_names=None,
-            feature_names=explainations[0].feature_names,
-            output_names=None,
-            output_indexes=None,
-            lower_bounds=None,
-            upper_bounds=None,
-            error_std=None,
-            main_effects=None,
-            hierarchical_values=None,
-            clustering=None,
-            compute_time=_total_compute_time(explainations),
-        )
-        # Base value
-        base = np.mean(np.hstack([k[:, :, c_class].base_values for k in explainations]))
-    # Case 6: interaction and multiclass
-    elif task["SHAP_INTERACTIONS"] and task["OBJECTIVE"] == "multiclass":
-        # Explainer object
-        shap_explainations = Explanation(
-            np.vstack([k.values for k in explainations]),
-            base_values=np.hstack([k.base_values for k in explainations]),
-            data=np.vstack([k.data for k in explainations]),
-            display_data=None,
-            instance_names=None,
-            feature_names=explainations[0].feature_names,
-            output_names=None,
-            output_indexes=None,
-            lower_bounds=None,
-            upper_bounds=None,
-            error_std=None,
-            main_effects=None,
-            hierarchical_values=None,
-            clustering=None,
-            compute_time=_total_compute_time(explainations),
-        )
-        # Base value
-        base = np.mean(np.hstack([k.base_values for k in explainations]))
-    # Case else
-    else:
-        # Raise error
-        raise ValueError("Unsupported task.")
-
-    # Return shap effects -----------------------------------------------------
-    return shap_explainations, base
 
 
 def print_shap_values(task, results, figs):
@@ -1545,8 +1290,8 @@ def print_shap_effects_interactions(task, results, figs):
 
         # Get SHAP effects interactions ---------------------------------------
         # SHAP effects
-        shap_effects_inter = np.array(
-            [np.mean(np.abs(k.values), axis=0) for k in results["explainations"]]
+        shap_effects_inter = get_interaction_effects(
+            task, results["explainations"], c_class
         )
         # Make dataframe
         shap_effects_inter_df = pd.DataFrame(
@@ -1563,8 +1308,8 @@ def print_shap_effects_interactions(task, results, figs):
             :, shap_effects_se_mean_sort.index
         ]
         # SHAP effects shuffle
-        shap_effects_inter_sh = np.array(
-            [np.mean(np.abs(k.values), axis=0) for k in results["explainations_sh"]]
+        shap_effects_inter_sh = get_interaction_effects(
+            task, results["explainations_sh"], c_class
         )
 
         # Additional info -----------------------------------------------------
@@ -1574,24 +1319,11 @@ def print_shap_effects_interactions(task, results, figs):
         x_names_count = len(task["x_names"])
 
         # Make labels with pvales ---------------------------------------------
-        # Get p values
-        pval = np.zeros((shap_effects_inter.shape[1], shap_effects_inter.shape[2]))
-        # Iterate over shap_effects
-        for x, y in np.ndindex(
-            (shap_effects_inter.shape[1], shap_effects_inter.shape[2])
-        ):
-            # Get current SHAP effect
-            c_effect = shap_effects_inter[:, x, y]
-            # Get current SHAP effect shuffle
-            c_effect_sh = shap_effects_inter_sh[:, x, y]
-            # Calculate p-value
-            _, pval[x, y] = corrected_ttest(c_effect - c_effect_sh)
-        # Multiple comparison correction
-        if task["MCC"]:
-            # Multiply p value by number of tests
-            pval = pval * (x_names_count**2)
-            # Set p values > 1 to 1
-            pval = pval.clip(None, 1)
+        # Get p values (shared with the estimator); the family of tests is all
+        # cells of the matrix
+        pval = adjust_pvalues(
+            effect_pvalues(shap_effects_inter, shap_effects_inter_sh), task["MCC"]
+        )
         # Initialize labels dataframe
         interaction_labels_df = pd.DataFrame(
             np.zeros([shap_effects_inter.shape[1], shap_effects_inter.shape[2]]),
@@ -1916,17 +1648,11 @@ def ilm_shap_values_graph(
         # x names lengths
         x_names_max_len = max([len(i) for i in task["x_names"]])
         # x names count
-        # Compute SHAP effect p values ----------------------------------------
-        # Init p value list
-        pval = {}
-        # Iterate over predictors
-        for pred_name, pred_data in shap_effects_df.items():
-            # Get current p value
-            _, c_pval = corrected_ttest(
-                pred_data.to_numpy() - shap_effects_sh_df[pred_name].to_numpy()
-            )
-            # Add to pval list
-            pval[pred_name] = np.around(c_pval, decimals=3)
+        # Compute SHAP effect p values (shared with the estimator) ----------------
+        raw_pval = pd.Series(
+            effect_pvalues(shap_effects_df.to_numpy(), shap_effects_sh_df.to_numpy()),
+            index=task["x_names"],
+        )
         excl = 0
         for e in exclude:
             idx = shap_explainations.feature_names.index(e)
@@ -1937,15 +1663,11 @@ def ilm_shap_values_graph(
             shap_explainations.data = np.delete(shap_explainations.data, idx, axis=1)
             excl += 1
             print(f"'{e}' has been removed.")
-        # Make pval series
+        # Adjust for multiple comparisons within the predictors that are shown
         x_names_count = len(task["x_names"])
-        pval_se = pd.Series(data=pval, index=task["x_names"])
-        # Multiple comparison correction
-        if task["MCC"]:
-            # Multiply p value by number of tests
-            pval_se = pval_se * (x_names_count - excl)
-            # Set p values > 1 to 1
-            pval_se = pval_se.clip(upper=1)
+        shown = [n for n in task["x_names"] if n not in exclude]
+        pval_se = raw_pval.copy()
+        pval_se[shown] = adjust_pvalues(raw_pval[shown].to_numpy(), task["MCC"])
         extra_x_names = {}
         extra_x_names_max_len = []
         for i, (c_pred, c_val) in enumerate(shap_effects_se_mean_sort.items()):
@@ -2142,6 +1864,20 @@ def _check_plot_types(plot_type, interactions):
     return [t for t in PLOT_TYPES if t in types]
 
 
+def _check_correction(correction):
+    """Validate ``multiple_comparison_correction``; return method or None."""
+    if correction is None or correction is False:
+        return None
+    if correction is True:
+        return "bonferroni"
+    if correction in CORRECTIONS:
+        return correction
+    raise ValueError(
+        "multiple_comparison_correction must be None, True or one of "
+        f"{CORRECTIONS}, got {correction!r}."
+    )
+
+
 def _check_figsize(figsize):
     """Validate ``figsize`` (None, a pair, or a dict plot type -> pair)."""
 
@@ -2175,7 +1911,7 @@ def make_figures(
     dpi=150,
     classes=None,
     shap_values_style="beeswarm",
-    multiple_comparison_correction=False,
+    multiple_comparison_correction=None,
 ):
     """
     Draw figures of a fitted estimator and return them for further editing.
@@ -2242,10 +1978,14 @@ def make_figures(
     shap_values_style : {'beeswarm', 'graph'}, default 'beeswarm'
         ``'beeswarm'``: standard SHAP beeswarm plot. ``'graph'``: alternative
         graph with effect sizes and p values (:func:`ilm_shap_values_graph`).
-    multiple_comparison_correction : bool, default False
-        Bonferroni correction: multiply every SHAP-effect p value by the
-        number of predictors (for interaction effects by the number of
-        predictors squared), capped at 1.
+    multiple_comparison_correction : {None, 'bonferroni', 'holm', 'fdr_bh'} or bool, default None
+        Correction of the p values of the SHAP effects shown in the figures:
+        Bonferroni, Holm (step-down, family-wise error rate) or
+        Benjamini-Hochberg (false discovery rate). ``True`` means
+        ``'bonferroni'``, ``None``/``False`` no correction. The family is the
+        predictors of a figure (for interaction effects all cells of the
+        matrix). The same p values are available as columns of
+        ``effect_sizes_`` and ``interaction_effects_`` of the estimator.
 
     Returns
     -------
@@ -2301,6 +2041,7 @@ def make_figures(
                 f"plot_kwargs entries {bad} are invalid: keys must be in "
                 f"{PLOT_KWARGS_KINDS} and values dicts."
             )
+    _check_correction(multiple_comparison_correction)
     if shap_values_style not in ("beeswarm", "graph"):
         raise ValueError("shap_values_style must be 'beeswarm' or 'graph'.")
     _check_format(fig_format, dpi)
@@ -2314,7 +2055,7 @@ def make_figures(
     select = None if classes is None else [labels.index(c) for c in classes]
 
     # Task for the figure functions -------------------------------------------------
-    task["MCC"] = bool(multiple_comparison_correction)
+    task["MCC"] = _check_correction(multiple_comparison_correction)
     task["CLASS_LABELS"] = labels
     task["CLASS_SELECT"] = select
     results = model.results_

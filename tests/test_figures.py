@@ -163,6 +163,34 @@ def test_classes_selection(clf, reg):
     assert {"fit_confusion", "fit_violin"} <= set(make_figures(clf, plot_type="fit"))
 
 
+@pytest.mark.parametrize("correction, column", [
+    (None, "p_value"), (False, "p_value"), (True, "p_value_bonferroni"),
+    ("bonferroni", "p_value_bonferroni"), ("holm", "p_value_holm"),
+    ("fdr_bh", "p_value_fdr_bh")])
+def test_effect_figure_shows_the_table_p_values(reg_plain, correction, column):
+    """The p values in the figure are those of effect_sizes_."""
+    from ncvgbdt.format import format_p
+    figs = make_figures(reg_plain, plot_type="shap_effects",
+                        multiple_comparison_correction=correction)
+    shown = sorted(t.get_text().split("|")[1] for t in figs["shap_effects"][1].texts)
+    expected = sorted(format_p(p) for p in reg_plain.effect_sizes_[column])
+    assert shown == expected
+
+
+def test_interaction_figure_shows_the_table_p_values(reg):
+    figs = make_figures(reg, plot_type="interaction_effects",
+                        multiple_comparison_correction="holm")
+    shown = sorted(t.get_text().split("\n")[1] for t in figs["interaction_effects"][1].texts)
+    expected = sorted(f"p {round(p, 3)}" for p in reg.interaction_effects_["p_value_holm"])
+    assert shown == expected
+
+
+def test_correction_argument_is_validated(reg_plain):
+    for bad in ("nope", 2, "Holm"):
+        with pytest.raises(ValueError, match="multiple_comparison_correction"):
+            make_figures(reg_plain, multiple_comparison_correction=bad)
+
+
 def test_shap_values_style_and_correction(reg_plain):
     graph = make_figures(reg_plain, plot_type="shap_values",
                          shap_values_style="graph",

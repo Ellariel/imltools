@@ -8,7 +8,7 @@ binary and multiclass targets, optionally with grouped observations (e.g. severa
 rows per participant).
 
 This code is a reused version with modifications by Danila Valko
-(d.v.valko[at]proton.me) of Dr. David Steyrl's codebase (david.steyrl[at]gmail.com).
+(danila.valko[at]proton.me) of Dr. David Steyrl's codebase (david.steyrl[at]gmail.com).
 Source code and description: https://github.com/univiemops/iml, one example here:
 https://doi.org/10.31219/osf.io/um69t. The SHAP project: https://github.com/shap/shap.
 
@@ -44,8 +44,8 @@ model.fit(df, df["mpg"], groups=None)  # groups: e.g. df['participant']
 
 model.cv_results_  # scores per outer fold, real vs. shuffled targets, tuned parameters
 model.shap_effects_  # mean |SHAP| per fold and predictor (long format)
-model.scores_summary_ # per metric: mean, sd, interval, shuffled baseline, p value
-model.effect_sizes_    # per predictor: effect, share, direction (slope per SD)
+model.scores_summary_  # per metric: mean, sd, interval, shuffled baseline, p value
+model.effect_sizes_  # per predictor: effect, share, direction (slope per SD)
 make_figures(model)  # figures into results/mpg/figures
 
 model = load_model("results/mpg")  # later, in another session
@@ -125,9 +125,20 @@ results/mpg/
 ## Design choices and caveats researchers should know
 
 ### Data and preprocessing
-- **Complete cases.** Rows with a missing value in the target, the group variable
-  or any predictor are dropped, separately for each target. Nothing is imputed
-  (LightGBM could handle missing values; this tool does not use that).
+- **Missing values.** Rows with a missing target or group are always dropped.
+  Missing *predictor* values are kept by default (`missing='native'`): nothing is
+  imputed, LightGBM learns for every split which way missing values go, and the
+  standardization ignores them. A predictor without any observed value raises an
+  error. The default assumes that missingness is either uninformative or that its
+  pattern is itself worth using: the model can use "missing" as information
+  (whether that is wanted depends on the missingness mechanism), and SHAP
+  attributes it to the predictor like any other value. A missing category of a
+  target-encoded (multi-category) predictor is not a category of its own; it is
+  encoded with the overall target mean, i.e. like an unknown category. With
+  `missing='drop'` every row with any missing predictor value is removed
+  (complete-case analysis). `used_index_` tells which rows were used; rows with
+  missing values are skipped in the direction summaries of `effect_sizes_`
+  (`slope_per_sd`, `corr_x_shap`).
 - **Groups matter.** With repeated measures per person, pass `groups`.
   Without it every row is its own group and rows of the same person can end up in
   train and test set, which inflates performance. A `TT` split with
@@ -151,9 +162,7 @@ results/mpg/
 - **Classification uses balanced accuracy**: every sample is weighted by
   `n / (n_classes * n_class)` (the scikit-learn `'balanced'` definition). The same
   weights are given to LightGBM as `class_weight` (frequencies of the training
-  fold) and weight the confusion matrix plot. *Earlier versions used the class
-  frequency itself as weight, which favours the majority class and contradicted
-  the documentation; accuracies from those versions are not comparable.*
+  fold) and weight the confusion matrix plot.
 - The confusion matrix is class-weighted, so its diagonal sums to the balanced
   accuracy.
 - **More metrics** (all out of sample, per outer test fold, also for the
@@ -241,13 +250,19 @@ its mirror image). Effects of correlated predictors are shared between them (see
 - **Multiclass with target-encoded predictors:** the encoder creates one column
   per class; their SHAP values (and interaction values) are summed back to a
   single value per predictor (SHAP values are additive).
+- **Multiclass interactions:** with `shap_interactions=True` the interaction
+  values are stored per class (rows x features x features x classes). The
+  interaction figures and all other SHAP figures are drawn once per class (file
+  names end in `_class_<label>`), as for a binary target. Summing the interaction
+  values of a feature over its partners gives its main SHAP value, so the effects
+  equal those of a run without interactions (tested).
 - **Binary tasks**: main-effect SHAP values are stored with a class axis for
   class 0 and class 1; class 0 is the exact mirror image of class 1 (kept for
   symmetry with multiclass). Interaction values are stored for the positive
   class only.
 - `shap_interactions=True` (the default is False) is slow and memory-hungry
-  (features squared) and is **not supported for multiclass targets**
-  (an error is raised before fitting). Switch it off for large problems.
+  (features squared, and times the number of classes for multiclass targets).
+  Leave it off for large problems.
 
 ### Reproducibility
 - `seed` (default 3141592) fixes every random step: outer and inner splits,
@@ -265,48 +280,105 @@ its mirror image). Effects of correlated predictors are shared between them (see
 ### Limitations
 - Fixed 5 outer and inner folds; no sample weights; no time-series splits.
 - Hyperparameter search covers three parameters only (see above).
-- Only LightGBM. Upstream's TabPFN variant, huber loss and `shapiq` extensions
-  are not ported.
+- Only LightGBM, with squared-error loss for regression (see the comparison with
+  upstream below).
 - Very small data sets (like mtcars) work as a smoke test but give noisy
   estimates.
 
-## Changes compared with the original code
+## Differences from the original (univiemops/iml)
 
-The function `run_analysis` was replaced by scikit-learn style estimators
-(`NCVGBDTRegressor`, `NCVGBDTClassifier`) with `fit(X, y, groups)`, fitted
-attributes, JSON storage, `resume` and an optional final model. The parameters
-changed accordingly (`type` -> `evaluation`, `g_name` -> `groups`,
-`test_set_ind` -> `fit(test_idx=...)`, `def_test_size` -> `test_size`,
-`objective` is inferred from the estimator and the target, `y_names` and
-`skip_rows` are gone: select columns and rows in pandas). Results stored by the
-old versions (pickle files) cannot be loaded. The code was also restructured
-(split into `estimator` / `fitting` / `plotting`, `src` layout, installable
-package). Bugs fixed and behaviours added:
+This package was derived from an earlier version of Dr. Steyrl's
+[iml](https://github.com/univiemops/iml) scripts and has **not** been merged with
+its later development. The comparison below is with the upstream state of
+6 July 2026 (commit `f565183`: `iml_2_mdl_lgbm.py`, `iml_3_plt.py`,
+`sklearn_repeated_group_k_fold.py`). Check upstream when you need the original
+behaviour; results of the two are not expected to be numerically identical.
 
-- Seeding of all random steps (`seed` parameter); earlier versions were only
-  partly seeded.
-- `type` default was `'cv'` but the code compared with `'CV'`, so the default
-  call failed; `evaluation` is now case-insensitive and validated. Mutable
-  default arguments removed.
-- Grouping crashed with a column name or a list of names; groups are now passed
-  as an array.
-- Without predictor lists the column order came from a Python `set` (random per
-  process); order is now stable.
-- Random test set for `TT` was drawn *with replacement* (duplicates, fewer test
-  rows), could never include the last row, ignored groups and mixed row labels
-  with positions. Now: group-disjoint random groups, positional indices.
-- NumPy 2 compatibility of the group k-fold (`np.unique` inverse shape).
-- Classification: balanced class weights (see "Scores"); target encoder uses
-  `binary`/`multiclass` target type instead of treating class codes as numbers;
-  multiclass SHAP aggregation; binary SHAP shape; confusion matrix.
-- Corrected t-test: the p value used `|t|` and called itself one-sided; it is now
-  truly one-sided.
-- `make_figures` paired task and result files by directory listing order; it now
-  takes the fitted estimator (or its directory). `ilm_shap_values_graph` could not exclude the first predictor.
-- pandas 3 compatibility of the interaction figures; running means ignore NaN
-  folds.
-- Not ported from upstream (checked, no bug): SHAP tree-explainer patches
-  mentioned in the upstream README were not needed with the tested versions.
+### Same as upstream
+Group-wise repeated 5-fold outer CV with an inner randomized search on the
+training data; fixed 100 leaves, learning rate 0.01 and 1000 rounds; classification
+scored by balanced accuracy with balanced class weights; target encoding of
+multi-category predictors inside the pipeline (binary/multiclass target type for
+classification, SHAP values summed back per predictor); shuffled-target baseline
+that reuses the tuned hyperparameters; tree SHAP without background data;
+one-sided corrected resampled t-test (signed t statistic) with optional Bonferroni
+correction; mean absolute SHAP value as predictor effect; missing predictor values
+handled by LightGBM; SHAP interaction values for multiclass targets (stored per class
+and aggregated over target-encoded columns).
+
+### Form and interface
+- **Package instead of scripts.** Upstream is a set of scripts configured by
+  editing `main()` (Excel input, log files, pickle output). Here: an installable
+  package (`src` layout, `pyproject.toml`, uv) with scikit-learn style estimators
+  (`NCVGBDTRegressor`, `NCVGBDTClassifier`), `fit(X, y, groups)`, fitted
+  attributes, `get_params` / `clone`, `y` and `groups` also by column name.
+- **Storage.** JSON per outer fold plus a manifest (settings, library versions,
+  data fingerprint) instead of pickles; `load_model`, `resume` of interrupted runs,
+  `save`. Upstream's pickles also hold the fitted pipeline of every outer fold, the
+  test predictors and test row indices; **this package does not store fold models or
+  per-fold row indices** (only predictions, scores, parameters and SHAP values).
+- **Optional final model** (`refit=True`): `predict`, `predict_proba`,
+  `explain(X)`. Upstream has no equivalent.
+- **Tests and documentation:** an automated test suite (reference values, exact
+  reproducibility, classification, grouped splits, storage, resuming), docstrings
+  with all options and defaults, and this README.
+- **Library versions.** Tested on Python 3.12 and 3.13 with current releases
+  (numpy 2, scikit-learn, shap 0.54, pandas 3) and with the older numpy 1.26 /
+  shap 0.46 / scikit-learn 1.5 stack. The shap source patches described in
+  upstream's `Readme.txt` were not needed for the configurations supported here.
+
+### Reproducibility
+Upstream fixes the outer split and the SHAP subsample (`random_state=1000`), but
+the inner CV, the parameter search, the target encoder, LightGBM, the shuffled
+targets and (for a train-test split) the row subsampling are unseeded. Here one
+`seed` determines every random step; the same seed, data and library versions
+give identical results (tested).
+
+### Model, tuning and sampling settings
+| | upstream | this package |
+|---|---|---|
+| Regression loss | Huber | squared error |
+| Row sampling | bagging | GOSS (`top_rate` 0.5) |
+| `min_child_samples` / `min_split_gain` / `min_child_weight` | 1 / 0 / 1e-5 | 2 / 1e-6 / 1e-6 |
+| `colsample_bytree` search | U(0.1, 1.0) | U(0.5, 1.0) |
+| `path_smooth` search | log-U(1, 100) | log-U(1, 1000) |
+| Inner search score (regression) | R2 | negative MSE |
+| Binary target | multiclass objective with 2 classes | binary objective |
+| Outer repetitions | derived from `N_PRED_OUTER_CV` (default 10000), at least 3 | `n_rep_outer_cv` (default 10) |
+| Inner repetitions | from `N_PRED_INNER_CV` (default 1000), 3 to 10 | from `n_samples_inner_cv` (default 10000), 1 to 10 |
+| SHAP rows | `N_SAMPLES_SHAP` (default 1000) in total, spread over the folds | `max_samples_shap` per outer fold (default 100) |
+| Train-test split rows | train and test subsampled to at most 10000 rows each | no subsampling |
+| SHAP interaction values | always computed | optional (default off) |
+
+### Evaluation and reporting
+- **Train-test split (`evaluation='TT'`):** a random test set of whole groups
+  (`test_size`) or the rows given in `test_idx`. Upstream takes row indices from
+  `randint.rvs(...)` in the configuration, which draws with replacement (duplicate
+  indices) and ignores groups.
+- **More metrics:** RMSE; for classification AUC, log loss, Brier score, MCC, kappa,
+  macro F1 and the pseudo R2 values McFadden, Cox-Snell, Nagelkerke and Tjur.
+  Upstream reports R2 and MAE (regression) and balanced accuracy (classification).
+- **Summaries:** `scores_summary_` (mean, sd, approximate interval, baseline,
+  p value per metric), `shap_effects_` and `effect_sizes_` (magnitude, share,
+  relative size, null reference, standardized slope and correlation as direction).
+- **Binary SHAP layout:** main-effect values carry a class axis (class 0 is the
+  mirror of class 1) so that the figures treat binary and multiclass alike.
+- **Figures:** `make_figures` takes a fitted estimator or its directory. The
+  plotting code stems from the earlier upstream version and was **not synced with
+  upstream's later rewrite of `iml_3_plt.py`**, so the set and look of the figures
+  differ; adjusted for current library versions (pandas 3) and the new layout.
+
+### Not supported or not ported
+- **Missing values:** as upstream, missing predictor values are left to LightGBM by
+  default; `missing='drop'` removes such rows instead. Rows with a missing target
+  are dropped in both; rows with a missing group are dropped here.
+- **Shap source patches:** upstream's `Readme.txt` describes two patches of shap's
+  `_tree.py`. They were not needed for the supported configurations, including
+  multiclass interaction values, with shap 0.46 and 0.54.
+- Upstream's other scripts: the exploratory data analysis (`iml_1_eda.py`) and the
+  TabPFN variant (`iml_2_mdl_tabpfn.py`); and the `shapiq` dependency.
+- Fixed 5 outer and inner folds (as upstream), and no tuning beyond the three
+  parameters listed above.
 
 ## Development
 

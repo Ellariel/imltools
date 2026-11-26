@@ -11,6 +11,7 @@ interpreting the figures (shuffled-target baseline, corrected t-test,
 SHAP effects, ...).
 '''
 
+import hashlib
 import os
 from itertools import permutations
 
@@ -27,6 +28,20 @@ from sklearn.metrics import confusion_matrix
 from .fitting import corrected_std  # noqa: F401
 from .fitting import corrected_ttest
 from .fitting import create_dir
+
+
+def _save_path(plots_path, stem, max_len=120):
+    """
+    Path (without extension) of a figure file in ``plots_path``.
+
+    Only the file name is shortened (to ``max_len`` characters, with a short
+    hash of the full name so that different long names stay different); the
+    directory is never cut.
+    """
+    if len(stem) > max_len:
+        digest = hashlib.md5(stem.encode('utf-8')).hexdigest()[:8]
+        stem = stem[:max_len - 9] + '_' + digest
+    return plots_path + '/' + stem
 
 
 def _total_compute_time(explainations):
@@ -118,11 +133,11 @@ def print_parameter_distributions(task, results, plots_path):
 
         # Save figure ---------------------------------------------------------
         # Make save path
-        save_path = (plots_path+'/'+task['ANALYSIS_NAME']+'_' +
+        save_path = _save_path(plots_path, task['ANALYSIS_NAME']+'_' +
                      '0'+'_' +
                      task['y_name'][0]+'_' +
                      'hyperparameter'+'_' +
-                     name)[:130]
+                     name)
         # Save figure
         plt.savefig(save_path+'.png', dpi=150, bbox_inches='tight')
         # Check if save as svg is enabled
@@ -262,9 +277,9 @@ def print_regression_scatter(task, results, plots_path):
 
     # Save figure -------------------------------------------------------------
     # Make save path
-    save_path = (plots_path+'/'+task['ANALYSIS_NAME']+'_' +
+    save_path = _save_path(plots_path, task['ANALYSIS_NAME']+'_' +
                  '1'+'_' +
-                 task['y_name'][0])[:130]
+                 task['y_name'][0])
     # Save figure
     plt.savefig(save_path+'.png', dpi=150, bbox_inches='tight')
     # Check if save as svg is enabled
@@ -368,10 +383,10 @@ def print_regression_violin(task, results, plots_path):
 
     # Save figure -------------------------------------------------------------
     # Make save path
-    save_path = (plots_path+'/'+task['ANALYSIS_NAME']+'_' +
+    save_path = _save_path(plots_path, task['ANALYSIS_NAME']+'_' +
                  '1'+'_' +
                  task['y_name'][0]+'_' +
-                 'distribution')[:130]
+                 'distribution')
     # Save figure
     plt.savefig(save_path+'.png', dpi=150, bbox_inches='tight')
     # Check if save as svg is enabled
@@ -493,9 +508,9 @@ def print_classification_confusion(task, results, plots_path):
 
     # Save figure -------------------------------------------------------------
     # Make save path
-    save_path = (plots_path+'/'+task['ANALYSIS_NAME']+'_' +
+    save_path = _save_path(plots_path, task['ANALYSIS_NAME']+'_' +
                  '1'+'_' +
-                 task['y_name'][0])[:130]
+                 task['y_name'][0])
     # Save figure
     plt.savefig(save_path+'.png', dpi=150, bbox_inches='tight')
     # Check if save as svg is enabled
@@ -593,10 +608,10 @@ def print_classification_violin(task, results, plots_path):
 
     # Save figure -------------------------------------------------------------
     # Make save path
-    save_path = (plots_path+'/'+task['ANALYSIS_NAME']+'_' +
+    save_path = _save_path(plots_path, task['ANALYSIS_NAME']+'_' +
                  '1'+'_' +
                  task['y_name'][0]+'_' +
-                 'distribution')[:130]
+                 'distribution')
     # Save figure
     plt.savefig(save_path+'.png', dpi=150, bbox_inches='tight')
     # Check if save as svg is enabled
@@ -821,10 +836,10 @@ def print_shap_effects(task, results, plots_path):
 
         # Save plot -----------------------------------------------------------
         # Make save path
-        save_path = (plots_path+'/'+task['ANALYSIS_NAME']+'_' +
+        save_path = _save_path(plots_path, task['ANALYSIS_NAME']+'_' +
                      '2'+'_' +
                      task['y_name'][0]+'_' +
-                     'shap_effects')[:130]
+                     'shap_effects')
         # Add class if no interactions and binary or multiclass
         if not task['SHAP_INTERACTIONS'] and (
                 task['OBJECTIVE'] == 'binary' or
@@ -974,10 +989,10 @@ def print_shap_effects_distribution(task, results, plots_path):
 
         # Save plots and results ----------------------------------------------
         # Make save path
-        save_path = (plots_path+'/'+task['ANALYSIS_NAME']+'_' +
+        save_path = _save_path(plots_path, task['ANALYSIS_NAME']+'_' +
                      '2'+'_' +
                      task['y_name'][0]+'_' +
-                     'shap_effects_distribution')[:130]
+                     'shap_effects_distribution')
         # Add class if no interactions and binary or multiclass
         if not task['SHAP_INTERACTIONS'] and (
                 task['OBJECTIVE'] == 'binary' or
@@ -1264,10 +1279,10 @@ def print_shap_values(task, results, plots_path):
 
         # Save plot -----------------------------------------------------------
         # Make save path
-        save_path = (plots_path+'/'+task['ANALYSIS_NAME']+'_' +
+        save_path = _save_path(plots_path, task['ANALYSIS_NAME']+'_' +
                      '3'+'_' +
                      task['y_name'][0]+'_' +
-                     'shap_values')[:130]
+                     'shap_values')
         # Add class if no interactions and binary or multiclass
         if not task['SHAP_INTERACTIONS'] and (
                 task['OBJECTIVE'] == 'binary' or
@@ -1387,11 +1402,11 @@ def print_shap_dependences(task, results, plots_path):
 
             # Save plot -------------------------------------------------------
             # Make save path
-            save_path = (plots_path+'/'+task['ANALYSIS_NAME']+'_' +
+            save_path = _save_path(plots_path, task['ANALYSIS_NAME']+'_' +
                          '4'+'_' +
                          task['y_name'][0]+'_' +
                          'shap_values_dependency'+'_' +
-                         str(c_pred))[:130]
+                         str(c_pred))
             # Add class if no interactions and binary or multiclass
             if not task['SHAP_INTERACTIONS'] and (
                     task['OBJECTIVE'] == 'binary' or
@@ -1589,10 +1604,10 @@ def print_shap_effects_interactions(task, results, plots_path):
 
         # Save plot -----------------------------------------------------------
         # Make save path
-        save_path = (plots_path+'/'+task['ANALYSIS_NAME']+'_' +
+        save_path = _save_path(plots_path, task['ANALYSIS_NAME']+'_' +
                      '5'+'_' +
                      task['y_name'][0]+'_' +
-                     'shap_effects_interactions')[:130]
+                     'shap_effects_interactions')
         # Add class if no interactions and binary or multiclass
         if not task['SHAP_INTERACTIONS'] and (
                 task['OBJECTIVE'] == 'binary' or
@@ -1720,12 +1735,12 @@ def print_shap_interaction_values(task, results, plots_path):
 
             # Save plot -------------------------------------------------------
             # Make save path
-            save_path = (plots_path+'/'+task['ANALYSIS_NAME']+'_' +
+            save_path = _save_path(plots_path, task['ANALYSIS_NAME']+'_' +
                          '6'+'_' +
                          task['y_name'][0]+'_' +
                          'shap_interaction_values'+'_' +
                          ind[0]+'_' +
-                         ind[1])[:130]
+                         ind[1])
             # Add class if no interactions and binary or multiclass
             if not task['SHAP_INTERACTIONS'] and (
                     task['OBJECTIVE'] == 'binary' or
@@ -1930,10 +1945,10 @@ def ilm_shap_values_graph(task, results, plots_path='./', title=None, exclude=[]
 
         # Save plot -----------------------------------------------------------
         # Make save path
-        save_path = (plots_path+'/'+task['ANALYSIS_NAME']+'_' +
+        save_path = _save_path(plots_path, task['ANALYSIS_NAME']+'_' +
                      '3'+'_' +
                      task['y_name'][0]+'_' +
-                     'shap_values')[:130]
+                     'shap_values')
         # Add class if no interactions and binary or multiclass
         if not task['SHAP_INTERACTIONS'] and (
                 task['OBJECTIVE'] == 'binary' or
@@ -1951,6 +1966,41 @@ def ilm_shap_values_graph(task, results, plots_path='./', title=None, exclude=[]
         plt.close()
     # Return None -------------------------------------------------------------
     return fig
+
+def _class_results(results, i_class):
+    """Results with the SHAP explanations reduced to one class (last axis)."""
+    def one(e):
+        return Explanation(
+            np.asarray(e.values)[..., i_class],
+            base_values=np.asarray(e.base_values)[..., i_class],
+            data=e.data, feature_names=e.feature_names,
+            compute_time=e.compute_time)
+    out = dict(results)
+    out['explainations'] = [one(e) for e in results['explainations']]
+    out['explainations_sh'] = [one(e) for e in results['explainations_sh']]
+    return out
+
+
+def _shap_figures(task, results, plots_path, def_shap_values,
+                  print_shap_effects_inter):
+    """All SHAP based figures of one task/results pair."""
+    # Plot SHAP effects
+    print_shap_effects(task, results, plots_path)
+    # Plot SHAP effects distribution
+    print_shap_effects_distribution(task, results, plots_path)
+    # Plot SHAP values
+    if def_shap_values:
+        print_shap_values(task, results, plots_path)
+    else:
+        ilm_shap_values_graph(task, results, plots_path)
+    # Plot SHAP dependencies
+    print_shap_dependences(task, results, plots_path)
+    if task['SHAP_INTERACTIONS'] and print_shap_effects_inter:
+        # Plot SHAP effects interactions
+        print_shap_effects_interactions(task, results, plots_path)
+        # Plot SHAP interaction values
+        print_shap_interaction_values(task, results, plots_path)
+
 
 def make_figures(model,
                  figures_dir=None,
@@ -1976,7 +2026,9 @@ def make_figures(model,
       effects and interaction value plots.
 
     For binary and multiclass tasks effects are drawn per class (for binary
-    tasks class 0 is the mirror image of class 1).
+    tasks class 0 is the mirror image of class 1). For multiclass targets with
+    SHAP interaction values, all SHAP figures are drawn for every class
+    (file names end in ``_class_<label>``).
 
     The p values printed in the figures come from a one-sided corrected
     resampled t-test (Nadeau & Bengio, 2003) of the real model against the
@@ -2063,28 +2115,20 @@ def make_figures(model,
         # Raise error
         raise ValueError('OBJECTIVE not found.')
 
-    # Plot SHAP effects -------------------------------------------------------
-    print_shap_effects(task, results, plots_path)
-
-    # Plot SHAP effects distribution ------------------------------------------
-    print_shap_effects_distribution(task, results, plots_path)
-
-    # Plot SHAP values --------------------------------------------------------
-    if def_shap_values:
-        print_shap_values(task, results, plots_path)
+    # SHAP figures ------------------------------------------------------------
+    if task['OBJECTIVE'] == 'multiclass' and task['SHAP_INTERACTIONS']:
+        # Interaction values exist per class. The interaction figures expect
+        # one (rows x features x features) array, so draw the SHAP figures
+        # for every class separately, like for a binary target.
+        for i_class, label in enumerate(model.classes_):
+            task_c = dict(task, OBJECTIVE='binary',
+                          y_name=[f"{task['y_name'][0]}_class_{label}"])
+            _shap_figures(task_c, _class_results(results, i_class),
+                          plots_path, def_shap_values,
+                          print_shap_effects_inter)
     else:
-        ilm_shap_values_graph(task, results, plots_path)
-
-    # Plot SHAP dependencies --------------------------------------------------
-    print_shap_dependences(task, results, plots_path)
-
-    # Plot SHAP effects interactions ------------------------------------------
-    if task['SHAP_INTERACTIONS'] and print_shap_effects_inter:
-        print_shap_effects_interactions(task, results, plots_path)
-
-    # Plot SHAP interaction values --------------------------------------------
-    if task['SHAP_INTERACTIONS'] and print_shap_effects_inter:
-        print_shap_interaction_values(task, results, plots_path)
+        _shap_figures(task, results, plots_path, def_shap_values,
+                      print_shap_effects_inter)
 
     # Return path of the figures ----------------------------------------------
     return plots_path

@@ -9,7 +9,7 @@ scoring and SHAP explanations. Figures are produced by
 :func:`ncvgbdt.plotting.make_figures`.
 
 This code is a reused version with modifications by Danila Valko
-(d.v.valko[at]proton.me) of Dr. David Steyrl's codebase
+(danila.valko[at]proton.me) of Dr. David Steyrl's codebase
 (david.steyrl[at]gmail.com). Source code and description:
 https://github.com/univiemops/iml, an example application:
 https://doi.org/10.31219/osf.io/um69t. The SHAP project:
@@ -45,6 +45,7 @@ from time import time
 
 import numpy as np
 import pandas as pd
+import sklearn
 from lightgbm import LGBMClassifier
 from lightgbm import LGBMRegressor
 from scipy.stats import loguniform
@@ -64,7 +65,9 @@ from sklearn.metrics import make_scorer
 from sklearn.metrics import mean_absolute_error
 from sklearn.metrics import mean_squared_error
 from sklearn.metrics import r2_score
+from sklearn.model_selection import KFold
 from sklearn.model_selection import RandomizedSearchCV
+from sklearn.model_selection import StratifiedKFold
 from sklearn.model_selection._split import _BaseKFold
 from sklearn.model_selection._split import _RepeatedSplits
 from sklearn.pipeline import Pipeline
@@ -390,6 +393,32 @@ def get_te_target_type(objective):
         ) from None
 
 
+def make_target_encoder(task):
+    """
+    Target encoder for the multi-category predictors.
+
+    Uses 5-fold cross-fitting with shuffling, seeded by ``task['SEED']``. From
+    scikit-learn 1.9 on, shuffling and seed are given to the encoder as a
+    splitter object (``shuffle`` and ``random_state`` are deprecated there);
+    older versions only accept the number of folds plus those two arguments.
+    Both give the same folds.
+    """
+    objective = task["OBJECTIVE"]
+    kwargs = dict(
+        categories=task["te_categories"],
+        target_type=get_te_target_type(objective),
+        smooth="auto",
+    )
+    seed = get_seed(task)
+    version = tuple(int(v) for v in sklearn.__version__.split(".")[:2])
+    if version >= (1, 9):
+        splitter = StratifiedKFold if objective != "regression" else KFold
+        return TargetEncoder(
+            cv=splitter(n_splits=5, shuffle=True, random_state=seed), **kwargs
+        )
+    return TargetEncoder(cv=5, shuffle=True, random_state=seed, **kwargs)
+
+
 def prepare(task):
     """
     Prepare the analysis pipeline and the hyperparameter search space.
@@ -424,14 +453,7 @@ def prepare(task):
 
     # Make preprocessing pipe -------------------------------------------------
     # Instatiate target-encoder
-    te = TargetEncoder(
-        categories=task["te_categories"],
-        target_type=get_te_target_type(task["OBJECTIVE"]),
-        smooth="auto",
-        cv=5,
-        shuffle=True,
-        random_state=get_seed(task),
-    )
+    te = make_target_encoder(task)
     # Get categorical predictors for target-encoder
     coltrans = ColumnTransformer(
         [
@@ -854,7 +876,7 @@ def tune_pipe(task, i_cv, pipe, space, g_trn, x_trn, y_trn):
 
 
 def corrected_std(differences, n_tst_over_n_trn=0.25):
-    '''
+    """
     Corrects standard deviation using Nadeau and Bengio's approach.
     Ref: Nadeau, C., Bengio, Y. Inference for the Generalization Error.
     Machine Learning 52, 239–281 (2003).
@@ -874,14 +896,14 @@ def corrected_std(differences, n_tst_over_n_trn=0.25):
     -------
     corrected_std : float
         Variance-corrected standard deviation of the set of differences.
-    '''
+    """
 
     # Get corrected std -------------------------------------------------------
     # kr = k times r, r times repeated k-fold crossvalidation,
     # kr equals the number of times the model was evaluated
     kr = len(differences)
     # Corrected variance
-    corrected_var = np.var(differences, ddof=1) * (1/kr + n_tst_over_n_trn)
+    corrected_var = np.var(differences, ddof=1) * (1 / kr + n_tst_over_n_trn)
     # Corrected standard deviation
     corrected_std = np.sqrt(corrected_var)
 
@@ -890,7 +912,7 @@ def corrected_std(differences, n_tst_over_n_trn=0.25):
 
 
 def corrected_ttest(differences, n_tst_over_n_trn=0.25):
-    '''
+    """
     Computes right-tailed paired t-test with corrected variance (H1: mean
     of ``differences`` > 0).
     Ref: Nadeau, C., Bengio, Y. Inference for the Generalization Error.
@@ -913,7 +935,7 @@ def corrected_ttest(differences, n_tst_over_n_trn=0.25):
         Variance-corrected t-statistic.
     p_val : float
         Variance-corrected p-value.
-    '''
+    """
 
     # Compute t statistics and p value ----------------------------------------
     # Get mean of differences
@@ -921,21 +943,32 @@ def corrected_ttest(differences, n_tst_over_n_trn=0.25):
     # Get corrected standard deviation
     std = corrected_std(differences, n_tst_over_n_trn)
     # Compute t statistics
-    if std >= 0.0 and std <= 0.0000001: # for technical purposes
+    if std >= 0.0 and std <= 0.0000001:  # for technical purposes
         t_stat = 0.0
         p_val = 1.0
     else:
         # Compute p value for right-tailed t-test (H1: mean > 0). A negative
         # t statistic (first model worse than second) is not significant.
         t_stat = mean / std
-        p_val = t.sf(t_stat, df=len(differences)-1)
+        p_val = t.sf(t_stat, df=len(differences) - 1)
     # Return t statistics and p value -----------------------------------------
     return t_stat, p_val
 
 
 REGRESSION_METRICS = ("r2", "mae", "mse", "rmse")
-BINARY_METRICS = ("acc", "auc", "logloss", "brier", "mcc", "kappa", "f1_macro",
-                  "mcfadden", "cox_snell", "nagelkerke", "tjur")
+BINARY_METRICS = (
+    "acc",
+    "auc",
+    "logloss",
+    "brier",
+    "mcc",
+    "kappa",
+    "f1_macro",
+    "mcfadden",
+    "cox_snell",
+    "nagelkerke",
+    "tjur",
+)
 MULTICLASS_METRICS = tuple(m for m in BINARY_METRICS if m != "tjur")
 # Metrics for which smaller is better
 LOWER_IS_BETTER = ("mae", "mse", "rmse", "logloss", "brier")
@@ -943,8 +976,11 @@ LOWER_IS_BETTER = ("mae", "mse", "rmse", "logloss", "brier")
 
 def metrics_for(objective):
     """Names of the scores computed for an objective (first one: main score)."""
-    return {"regression": REGRESSION_METRICS, "binary": BINARY_METRICS,
-            "multiclass": MULTICLASS_METRICS}[objective]
+    return {
+        "regression": REGRESSION_METRICS,
+        "binary": BINARY_METRICS,
+        "multiclass": MULTICLASS_METRICS,
+    }[objective]
 
 
 def classification_metrics(y_true, y_pred, proba, classes, class_weights):
@@ -996,36 +1032,40 @@ def classification_metrics(y_true, y_pred, proba, classes, class_weights):
     out["acc"] = float(np.average(y_pred == y_true, weights=weights))
     out["mcc"] = float(matthews_corrcoef(y_true, y_pred))
     out["kappa"] = float(cohen_kappa_score(y_true, y_pred))
-    out["f1_macro"] = float(f1_score(y_true, y_pred, average="macro",
-                                     zero_division=0))
+    out["f1_macro"] = float(f1_score(y_true, y_pred, average="macro", zero_division=0))
     if (idx < 0).any():
         # A test label the model never saw: probability metrics undefined
         return out
     p = np.clip(np.asarray(proba, dtype=float), 1e-15, 1.0)
     onehot = np.eye(k)[idx]
     # Log-likelihoods per sample (weighted mean); null: equal probabilities
-    ll = float(np.average(np.log(p[np.arange(len(idx)), idx]),
-                          weights=weights))
+    ll = float(np.average(np.log(p[np.arange(len(idx)), idx]), weights=weights))
     ll0 = -np.log(k)
     out["logloss"] = -ll
     out["mcfadden"] = 1.0 - ll / ll0
     out["cox_snell"] = 1.0 - np.exp(2.0 * (ll0 - ll))
     out["nagelkerke"] = out["cox_snell"] / (1.0 - np.exp(2.0 * ll0))
     if k == 2:
-        out["brier"] = float(np.average((p[:, 1] - onehot[:, 1]) ** 2,
-                                        weights=weights))
+        out["brier"] = float(np.average((p[:, 1] - onehot[:, 1]) ** 2, weights=weights))
         if (idx == 0).any() and (idx == 1).any():
             out["tjur"] = float(p[idx == 1, 1].mean() - p[idx == 0, 1].mean())
     else:
-        out["brier"] = float(np.average(((p - onehot) ** 2).sum(axis=1),
-                                        weights=weights))
+        out["brier"] = float(
+            np.average(((p - onehot) ** 2).sum(axis=1), weights=weights)
+        )
     try:
         if k == 2:
             out["auc"] = float(roc_auc_score(onehot[:, 1], p[:, 1]))
         else:
-            out["auc"] = float(roc_auc_score(
-                y_true, p / p.sum(axis=1, keepdims=True), multi_class="ovr",
-                average="macro", labels=classes))
+            out["auc"] = float(
+                roc_auc_score(
+                    y_true,
+                    p / p.sum(axis=1, keepdims=True),
+                    multi_class="ovr",
+                    average="macro",
+                    labels=classes,
+                )
+            )
     except ValueError:
         pass  # a class is missing in the test data
     return {k_: float(v) for k_, v in out.items()}
@@ -1086,8 +1126,8 @@ def score_predictions(task, pipe, x_tst, y_tst, y):
         proba = pipe.predict_proba(x_tst)
         # Metrics (balanced accuracy, AUC, log loss, pseudo R2, ...)
         metrics = classification_metrics(
-            y_tst.squeeze().to_numpy(), y_pred, proba, pipe.classes_,
-            class_weights)
+            y_tst.squeeze().to_numpy(), y_pred, proba, pipe.classes_, class_weights
+        )
         if task["OBJECTIVE"] == "multiclass":
             metrics.pop("tjur")
         # Results
@@ -1214,7 +1254,8 @@ def get_explainations(task, pipe, x_trn, x_tst, max_samples="task"):
         original target (regression) or log-odds (classification).
         ``values`` has shape (n, features) for regression, (n, features, 2)
         for binary and (n, features, classes) for multiclass tasks; with
-        interaction values (n, features, features) for regression and binary.
+        interaction values (n, features, features) for regression and binary
+        and (n, features, features, classes) for multiclass.
         ``data`` holds the unscaled predictor values.
     """
 

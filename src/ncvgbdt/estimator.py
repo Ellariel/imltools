@@ -116,6 +116,7 @@ class _NCVGBDTBase(BaseEstimator):
         max_samples_shap=100,
         shap_interactions=False,
         test_size=0.2,
+        missing="native",
         refit=False,
         seed=DEFAULT_SEED,
         analysis_name="analysis",
@@ -133,6 +134,7 @@ class _NCVGBDTBase(BaseEstimator):
         self.max_samples_shap = max_samples_shap
         self.shap_interactions = shap_interactions
         self.test_size = test_size
+        self.missing = missing
         self.refit = refit
         self.seed = seed
         self.analysis_name = analysis_name
@@ -144,9 +146,10 @@ class _NCVGBDTBase(BaseEstimator):
         """
         Run the nested cross-validation (and the final refit if requested).
 
-        Rows with a missing value in ``y``, ``groups`` or any used predictor
-        are dropped (complete-case analysis); ``used_index_`` tells which
-        rows were used.
+        Rows with a missing value in ``y`` or ``groups`` are always dropped.
+        Missing predictor values are handled by LightGBM (``missing='native'``,
+        default) or the rows are dropped (``missing='drop'``);
+        ``used_index_`` tells which rows were used.
 
         Parameters
         ----------
@@ -183,6 +186,10 @@ class _NCVGBDTBase(BaseEstimator):
             )
         if not isinstance(self.shap_interactions, (bool, np.bool_)):
             raise ValueError("shap_interactions can be True or False only.")
+        if self.missing not in ("native", "drop"):
+            raise ValueError(
+                f"missing must be 'native' or 'drop', got {self.missing!r}."
+            )
         if not 0 < self.test_size < 1:
             raise ValueError("test_size must be between 0 and 1.")
         if self.resume and self.output_dir is None:
@@ -238,24 +245,29 @@ class _NCVGBDTBase(BaseEstimator):
                 raise ValueError("X and groups have different lengths.")
             g = pd.DataFrame({"groups": groups})
 
-        # Complete cases --------------------------------------------------------
+        # Rows to use -------------------------------------------------------------
+        # Target and groups must be known; predictors only if missing='drop'
         x = X[x_names].reset_index(drop=True)
-        mask = (x.notna().all(axis=1) & y.notna() & g.notna().all(axis=1)).to_numpy()
+        complete = x.notna().all(axis=1) if self.missing == "drop" else True
+        mask = (y.notna() & g.notna().all(axis=1) & complete).to_numpy()
         pos = np.arange(n)
-        print(f"DV={name}, N={int(mask.sum())} of {n}")
+        n_missing_x = int(x[mask].isna().any(axis=1).sum())
+        print(
+            f"DV={name}, N={int(mask.sum())} of {n}"
+            + (f" ({n_missing_x} with missing predictor values)" if n_missing_x else "")
+        )
         if mask.sum() < 10:
-            raise ValueError("Fewer than 10 complete rows.")
-        # Categories of target encoded predictors (does not use targets)
+            raise ValueError("Fewer than 10 usable rows.")
+        empty = [c for c in x_names if x.loc[mask, c].isna().all()]
+        if empty:
+            raise ValueError(f"Predictors without any observed value: {empty}")
+        # Categories of target encoded predictors (does not use targets). A
+        # missing category is not one of them: it is encoded like an unknown
+        # category, i.e. with the overall target mean.
         te_categories = [np.sort(x[c].dropna().unique()) for c in x_mult]
 
         # Objective ---------------------------------------------------------------
         objective, classes = self._get_objective(y[mask])
-        if objective == "multiclass" and self.shap_interactions:
-            raise ValueError(
-                "shap_interactions=True is not supported for multiclass "
-                "targets (per-class interaction figures are not "
-                "implemented). Use shap_interactions=False."
-            )
         get_te_target_type(objective)
 
         # Task description ----------------------------------------------------
@@ -685,12 +697,16 @@ class _NCVGBDTBase(BaseEstimator):
                 if name in nominal or n < 2:
                     continue
                 x = data[:, j].astype(float)
+                ok = np.isfinite(x)  # rows with a missing value are skipped
+                if ok.sum() < 2:
+                    continue
+                x = x[ok]
                 sd = x.std(ddof=1)
                 if not np.isfinite(sd) or sd == 0:
                     continue
                 for ci in range(c):
-                    sv = v[:, j, ci]
-                    cov = ((x - x.mean()) * (sv - sv.mean())).sum() / (n - 1)
+                    sv = v[ok, j, ci]
+                    cov = ((x - x.mean()) * (sv - sv.mean())).sum() / (len(x) - 1)
                     sl[j, ci] = cov / sd
                     ssd = sv.std(ddof=1)
                     if ssd > 0:
@@ -809,12 +825,19 @@ class NCVGBDTRegressor(_NCVGBDTBase):
     max_samples_shap : int, default 100
         SHAP values are computed for at most this many randomly chosen rows
         of every outer test set.
-    shap_interactions : bool, default True
+    shap_interactions : bool, default False
         Also compute SHAP interaction values (slow, memory: features
-        squared). Not supported for multiclass targets.
+        squared, times the number of classes for multiclass targets).
     test_size : float, default 0.2
         'TT' only: wanted fraction of test rows when ``test_idx`` is not
         given; whole groups are drawn at random.
+    missing : {'native', 'drop'}, default 'native'
+        How to treat rows with missing predictor values. 'native': keep
+        them; LightGBM learns where missing values go in every split, and
+        the scaler ignores them. A missing category of a target-encoded
+        predictor is encoded with the overall target mean. 'drop': drop
+        every row with any missing predictor value (complete-case
+        analysis). Rows with a missing target or group are always dropped.
     refit : bool, default False
         Also tune and fit one final model on all rows (one more inner
         search). Required for ``predict``, ``explain`` and
@@ -862,7 +885,7 @@ class NCVGBDTRegressor(_NCVGBDTBase):
     target_std_ : float or None
         Standard deviation of the (used) target values, regression only.
     used_index_ : ndarray of int
-        Positions in ``X`` of the complete-case rows that were used.
+        Positions in ``X`` of the rows that were used.
     target_name_ : str
     task_, results_ : dict
         Settings and raw results (as used by the figures).
@@ -893,7 +916,8 @@ class NCVGBDTClassifier(_NCVGBDTBase):
     any labels; two classes are fitted as binary, three or more as
     multiclass (``classes_`` holds the labels in sorted order). Performance
     is the **balanced accuracy** (inverse-frequency class weights).
-    ``shap_interactions=True`` is not supported for more than two classes.
+    With ``shap_interactions=True`` the interaction values are stored per
+    class and the interaction figures are drawn for every class.
     Additional method: ``predict_proba`` (needs ``refit=True``).
     """
 

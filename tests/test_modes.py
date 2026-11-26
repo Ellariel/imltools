@@ -15,7 +15,7 @@ import matplotlib
 matplotlib.use("Agg")
 
 from ncvgbdt import (NCVGBDTClassifier, NCVGBDTRegressor,  # noqa: E402
-                     make_figures)
+                     load_model, make_figures)
 from ncvgbdt.fitting import (  # noqa: E402
     aggregate_shap_explanations, classification_metrics, get_class_w,
     get_te_target_type, get_test_groups, metrics_for)
@@ -50,6 +50,20 @@ def test_class_weights_are_inverse_frequency():
     assert w[1] == pytest.approx(100 / (2 * 20))
     # Balanced data -> all weights 1
     assert set(get_class_w(np.array([0, 1, 2] * 5)).values()) == {1.0}
+
+
+def test_figure_file_names_are_not_cut_by_the_directory():
+    """File names used to be truncated together with the directory, so long
+    output paths made different figures overwrite each other."""
+    from ncvgbdt.plotting import _save_path
+    long_dir = '/very/long/' + 'x' * 200
+    a = _save_path(long_dir, 'analysis_CV_5_y_class_0_shap_effects')
+    b = _save_path(long_dir, 'analysis_CV_5_y_class_1_shap_effects')
+    assert a.startswith(long_dir + '/') and a != b
+    # a very long file name is shortened, but stays unique
+    c = _save_path('d', 'z' * 300 + 'a')
+    d = _save_path('d', 'z' * 300 + 'b')
+    assert len(c) < 140 and c != d
 
 
 def test_te_target_type():
@@ -120,9 +134,11 @@ def test_validation_errors(data):
         NCVGBDTRegressor(**FAST).fit(X, data['y'].iloc[:-1])
     with pytest.raises(ValueError, match="resume"):
         NCVGBDTRegressor(resume=True, **FAST).fit(X, data['y'])
-    with pytest.raises(ValueError, match="multiclass"):
-        NCVGBDTClassifier(shap_interactions=True, **FAST).fit(
-            X, data['multi'])
+    with pytest.raises(ValueError, match="missing must be"):
+        NCVGBDTRegressor(missing='nope', **FAST).fit(X, data['y'])
+    all_nan = X.assign(a=np.nan)
+    with pytest.raises(ValueError, match="without any observed value"):
+        NCVGBDTRegressor(**FAST).fit(all_nan, data['y'])
     with pytest.raises(ValueError, match="two classes"):
         NCVGBDTClassifier(shap_interactions=False, **FAST).fit(
             X, np.zeros(len(X)))
@@ -267,38 +283,85 @@ def test_default_arguments_run(data):
     assert model.target_name_ == 'y'
 
 
-def test_missing_values_are_dropped(data):
-    X = data[['a', 'b', 'c']].copy()
-    X.loc[3, 'a'] = np.nan
-    y = data['y'].copy()
-    y.loc[7] = np.nan
-    model = NCVGBDTRegressor(shap_interactions=False, **FAST)
-    model.fit(X, y, groups=data['pid'])
-    assert model.n_samples_used_ == len(X) - 2
-    assert 3 not in model.used_index_ and 7 not in model.used_index_
+def _with_missing(data):
+    """Predictors of every kind with missing values and one missing target."""
+    rng = np.random.default_rng(3)
+    df = data[['pid', 'a', 'b', 'c', 'y']].copy()
+    df['d'] = rng.integers(0, 2, len(df)).astype(float)
+    for col, frac in (('a', .15), ('b', .1), ('c', .15), ('d', .1)):
+        df.loc[rng.random(len(df)) < frac, col] = np.nan
+    df.loc[7, 'y'] = np.nan
+    return df
 
 
-def test_target_and_groups_by_column_name(data):
-    """Names and arrays give identical results; the target and the group
-    column are never used as predictors by default."""
-    sub = data[['pid', 'a', 'b', 'y']]
-    by_name = NCVGBDTRegressor(shap_interactions=False, **FAST).fit(
-        sub, 'y', groups='pid')
-    by_array = NCVGBDTRegressor(shap_interactions=False, **FAST).fit(
-        sub, sub['y'], groups=sub['pid'])
-    for m in (by_name, by_array):
-        assert list(m.feature_names_in_) == ['a', 'b']
-        assert m.target_name_ == 'y'
-    pd.testing.assert_frame_equal(by_name.cv_results_, by_array.cv_results_)
+def test_missing_predictors_drop_mode(data):
+    df = _with_missing(data)
+    names = dict(x_con_names=['a', 'b'], x_cat_bin_names=['d'],
+                 x_cat_mult_names=['c'])
+    model = NCVGBDTRegressor(missing='drop', shap_interactions=False,
+                             **names, **FAST).fit(df, 'y', groups='pid')
+    complete = df[['a', 'b', 'c', 'd', 'y']].notna().all(axis=1)
+    assert model.n_samples_used_ == int(complete.sum())
+    np.testing.assert_array_equal(model.used_index_,
+                                  np.flatnonzero(complete))
 
 
-def test_column_name_errors(data):
-    sub = data[['pid', 'a', 'b', 'y']]
-    with pytest.raises(KeyError, match="'nope' given as y"):
-        NCVGBDTRegressor(**FAST).fit(sub, 'nope')
-    with pytest.raises(KeyError, match="'nope' given as groups"):
-        NCVGBDTRegressor(**FAST).fit(sub, 'y', groups='nope')
-    with pytest.raises(ValueError, match="leak"):
-        NCVGBDTRegressor(x_con_names=['a', 'y'], **FAST).fit(sub, 'y')
-    with pytest.raises(ValueError, match="leak"):
-        NCVGBDTRegressor(x_con_names=['a', 'y'], **FAST).fit(sub, sub['y'])
+def test_missing_predictors_native_mode(data, tmp_path):
+    """Default: only rows with a missing target are dropped; the model, SHAP,
+    the final model, storage and figures cope with missing predictors."""
+    df = _with_missing(data)
+    names = dict(x_con_names=['a', 'b'], x_cat_bin_names=['d'],
+                 x_cat_mult_names=['c'])
+    model = NCVGBDTRegressor(refit=True, shap_interactions=True,
+                             output_dir=tmp_path, **names, **FAST)
+    model.fit(df, 'y', groups='pid')
+    assert model.missing == 'native'
+    assert model.n_samples_used_ == len(df) - 1
+    assert 7 not in model.used_index_
+    assert df[['a', 'b', 'c', 'd']].isna().any(axis=1).sum() > 30
+    # the explained data still contain the missing values
+    shown = np.asarray(model.explanations_[0].data, dtype=float)
+    assert np.isnan(shown).any()
+    # effect sizes use the observed rows; direction undefined for nominal 'c'
+    es = model.effect_sizes_.set_index('feature')
+    assert es['effect'].notna().all()
+    assert es.loc['a', 'corr_x_shap'] > 0.5
+    assert np.isnan(es.loc['c', 'slope_per_sd'])
+    # the final model predicts and explains rows with missing values
+    rows = df[df[['a', 'b', 'c', 'd']].isna().any(axis=1)].head(5)
+    assert np.isfinite(model.predict(rows)).all()
+    assert model.explain(rows).values.shape[0] == 5
+    # round trip keeps everything, including the missing values
+    loaded = load_model(tmp_path)
+    pd.testing.assert_frame_equal(loaded.effect_sizes_, model.effect_sizes_)
+    np.testing.assert_array_equal(
+        np.isnan(np.asarray(loaded.explanations_[0].data, dtype=float)),
+        np.isnan(shown))
+    out = make_figures(loaded, figures_dir=tmp_path / 'figs')
+    assert len(list(Path(out).glob('*.png'))) >= 10
+
+
+def test_multiclass_shap_interactions(data, tmp_path):
+    """Interaction values per class; their sum over the second feature axis
+    equals the main SHAP values, so effects match a run without them."""
+    kw = dict(x_con_names=['a', 'b'], x_cat_mult_names=['c'], **FAST)
+    kw.pop('max_samples_shap')
+    inter = NCVGBDTClassifier(shap_interactions=True, max_samples_shap=12,
+                              output_dir=tmp_path, **kw)
+    inter.fit(data, 'multi', groups='pid')
+    main = NCVGBDTClassifier(shap_interactions=False, max_samples_shap=12,
+                             **kw).fit(data, 'multi', groups='pid')
+    # (rows, features, features, classes), target encoding aggregated
+    assert inter.explanations_[0].values.shape == (12, 3, 3, 3)
+    assert inter.explanations_[0].feature_names == ['a', 'b', 'c']
+    keys = ['fold', 'class', 'feature']
+    a = inter.shap_effects_.set_index(keys)
+    b = main.shap_effects_.set_index(keys)
+    np.testing.assert_allclose(a['effect'], b['effect'], atol=1e-8)
+    assert len(inter.effect_sizes_) == 3 * 3
+    # one set of SHAP figures per class
+    out = make_figures(inter, figures_dir=tmp_path / 'figs')
+    names = [p.name for p in Path(out).glob('*.png')]
+    for label in inter.classes_:
+        assert any(f'_class_{label}_' in n and 'inter' in n for n in names)
+    assert len(names) >= 3 * 10

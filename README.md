@@ -143,10 +143,23 @@ results/mpg/
   (complete-case analysis). `used_index_` tells which rows were used; rows with
   missing values are skipped in the direction summaries of `effect_sizes_`
   (`slope_per_sd`, `corr_x_shap`).
-- **Groups matter.** With repeated measures per person, pass `groups`.
-  Without it every row is its own group and rows of the same person can end up in
-  train and test set, which inflates performance. A `TT` split with
-  `test_idx` that shares groups between train and test raises a warning.
+- **What `groups` is for.** `groups` says which rows belong together: all rows
+  with the same group value always end up on the same side of every split (outer
+  folds, inner tuning folds and train-test split). Pass it whenever rows are not
+  independent, e.g. several measurements per person; without it every row is its
+  own group, rows of the same person can land in both train and test set, and the
+  performance is inflated. A `TT` split with `test_idx` that shares groups between
+  train and test raises a warning.
+  - **The group is the unit the model is tested on.** With participants nested in
+    countries, `groups=participant` asks "how well does the model predict new
+    people?", while `groups=country` leaves whole countries out and asks "how well
+    does it predict people from countries it has never seen?" (stricter; needs at
+    least 5 countries, and a few very large countries make the folds uneven).
+    Grouping by the coarser level keeps the finer level (participants) together too.
+  - If the country should be a **predictor** (`x_cat_mult_names`), group by
+    participant, not by country: with `groups=country` every test country is
+    unseen and its category carries no information.
+  - `groups` takes a single column; there are no nested levels.
 - **Predictor types.** Continuous predictors are standardized. Binary predictors
   must already be numeric (0/1). Predictors with more than two categories are
   target encoded (scikit-learn `TargetEncoder`, `smooth='auto'`, internal 5-fold

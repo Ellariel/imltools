@@ -166,3 +166,4 @@ cython_debug/
 
 # example output
 test/
+examples/example_output/

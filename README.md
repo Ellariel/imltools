@@ -64,6 +64,11 @@ used as predictors by default); the estimators support `get_params`, `set_params
 method with options and defaults is documented in the docstrings, e.g.
 `help(ncvgbdt.NCVGBDTRegressor)` and `help(ncvgbdt.make_figures)`.
 
+A full walkthrough (grouped data, missing values, regression, classification, effect
+sizes, editable figures, interactions, choosing the grouping unit, final model, saving
+and loading) is in [examples/full_example.ipynb](examples/full_example.ipynb). The
+`examples/` folder is not part of the installed package.
+
 `fit` runs the **evaluation**: nested cross-validation giving an honest
 performance estimate and SHAP effects. It does not leave you with one "the
 model": every outer fold has its own tuned model. If you also want to predict,

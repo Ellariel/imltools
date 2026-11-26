@@ -272,11 +272,32 @@ rows:
   effect that arises without any real relation (a null reference);
   `effect_rel_target_sd` (regression): `effect` relative to the target's standard
   deviation. Units: target units (regression) or log-odds (classification).
+- `p_value`: one-sided p value that the effect is larger than `effect_shuffled`
+  (the corrected resampled t-test over the outer folds, see below), and the same
+  adjusted for the number of predictors (per class): `p_value_bonferroni`,
+  `p_value_holm` (Holm's step-down procedure) and `p_value_fdr_bh` (Benjamini-
+  Hochberg false discovery rate). NaN for a single split (`evaluation='TT'`).
 - `slope_per_sd` (with interval) and `corr_x_shap`: **direction and a linear
   summary** of the effect: the slope of the SHAP values on the predictor times
   its standard deviation (about the change of the prediction per +1 SD of the
   predictor), and the correlation between predictor values and SHAP values.
   Both are NaN for multi-category predictors, which have no order.
+
+Related tables, all available without drawing figures:
+
+- `model.interaction_effects_` (needs `shap_interactions=True`): one row per cell of
+  the predictor matrix and class (`feature_a`, `feature_b`) with the mean absolute
+  interaction value, the shuffled-model value and the same four p-value columns. The
+  family of tests is all cells of the matrix, which is conservative because the matrix
+  is symmetric.
+- `model.shap_values_`: every explained test row in long format (fold, row, class,
+  feature, feature value, SHAP value); `model.shap_explanation(class_=None,
+  shuffled=False, interactions=False)` returns the same pooled over the folds as one
+  `shap.Explanation` for your own SHAP plots. With interaction values the main
+  values are the sums over the interaction partners.
+
+The figures read the same numbers: `make_figures(...,
+multiple_comparison_correction=...)` only selects which column is printed.
 
 Caveats: a boosted-tree model has no coefficients, so these are *summaries of a
 possibly non-linear, interacting function*, not regression coefficients. A low
@@ -302,9 +323,17 @@ its mirror image). Effects of correlated predictors are shared between them (see
   approximate. They also shrink as `n_rep_outer_cv` grows although no new data
   came in. Treat them as a rough screen; report effect sizes and fold
   distributions. For `evaluation='TT'` there is only one fold and no meaningful p value.
-- `add_multiple_comparison_correction=True` is a plain Bonferroni correction
-  (p x number of predictors, for interactions x predictors squared). p values are
-  rounded to 3 decimals before it is applied.
+- **Multiple comparisons.** Many predictors are tested at once, so the p values
+  come in four versions (columns of `effect_sizes_` and `interaction_effects_`, and
+  the choice `multiple_comparison_correction` of `make_figures`): unadjusted,
+  `bonferroni` (p x number of tests; controls the probability of any false
+  positive, most conservative), `holm` (step-down; same guarantee, never less
+  powerful than Bonferroni) and `fdr_bh` (Benjamini-Hochberg; controls the expected
+  share of false discoveries among the effects called significant, less
+  conservative; assumes independent or positively dependent tests, which correlated
+  predictors only roughly satisfy). The family is the predictors of one class (for
+  interaction effects all cells of the matrix). P values are not rounded before
+  they are adjusted.
 
 ### SHAP
 - Tree SHAP with `feature_perturbation='tree_path_dependent'` and no background
@@ -405,7 +434,7 @@ multi-category predictors inside the pipeline (binary/multiclass target type for
 classification, SHAP values summed back per predictor); shuffled-target baseline
 that reuses the tuned hyperparameters; tree SHAP without background data;
 one-sided corrected resampled t-test (signed t statistic) with optional Bonferroni
-correction; mean absolute SHAP value as predictor effect; missing predictor values
+correction (here also Holm and false discovery rate); mean absolute SHAP value as predictor effect; missing predictor values
 handled by LightGBM; SHAP interaction values for multiclass targets (stored per class
 and aggregated over target-encoded columns).
 

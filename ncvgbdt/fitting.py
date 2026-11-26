@@ -1429,6 +1429,390 @@ def print_current_results(task, t_start, scores, scores_sh):
     return
 
 
+def _total_compute_time(explainations):
+    """Sum of the SHAP compute times (missing times count as 0)."""
+    return float(np.sum([k.compute_time or 0 for k in explainations]))
+
+
+def get_shap_effects(task, explainations, c_class=-1):
+    """
+    Get SHAP based global effects.
+
+    Parameters
+    ----------
+    task : dictionary
+        Dictionary holding the task describtion variables.
+    explainations : list of shap explaination objects
+        SHAP explaination holding the results of the ml analyses.
+    c_class : integer
+        Current class for slicing.
+
+    Returns
+    -------
+    shap_effects : list
+        SHAP effects.
+    shap_base : float
+        Base value corresponds to expected value of the predictor.
+    """
+
+    # Get shap effects --------------------------------------------------------
+    # Case 1: no interaction and regression
+    if not task["SHAP_INTERACTIONS"] and task["OBJECTIVE"] == "regression":
+        # SHAP effects
+        shap_effects = [np.mean(np.abs(k.values), axis=0) for k in explainations]
+        # Base value
+        base = np.mean(np.hstack([k.base_values for k in explainations]))
+    # Case 2: interaction and regression
+    elif task["SHAP_INTERACTIONS"] and task["OBJECTIVE"] == "regression":
+        # Get SHAP effects
+        shap_effects = [
+            np.mean(np.abs(np.sum(k.values, axis=2)), axis=0) for k in explainations
+        ]
+        # Base value
+        base = np.mean(np.hstack([k.base_values for k in explainations]))
+    # Case 3: no interaction and binary
+    elif not task["SHAP_INTERACTIONS"] and task["OBJECTIVE"] == "binary":
+        # SHAP effects
+        shap_effects = [
+            np.mean(np.abs(k.values[:, :, c_class]), axis=0) for k in explainations
+        ]
+        # Base value
+        base = np.mean(np.hstack([k[:, :, c_class].base_values for k in explainations]))
+    # Case 4: interaction and binary
+    elif task["SHAP_INTERACTIONS"] and task["OBJECTIVE"] == "binary":
+        # Get SHAP effects
+        shap_effects = [
+            np.mean(np.abs(np.sum(k.values, axis=2)), axis=0) for k in explainations
+        ]
+        # Base value
+        base = np.mean(np.hstack([k.base_values for k in explainations]))
+    # Case 5: no interaction and multiclass
+    elif not task["SHAP_INTERACTIONS"] and task["OBJECTIVE"] == "multiclass":
+        # SHAP effects
+        shap_effects = [
+            np.mean(np.abs(k.values[:, :, c_class]), axis=0) for k in explainations
+        ]
+        # Base value
+        base = np.mean(np.hstack([k[:, :, c_class].base_values for k in explainations]))
+    # Case 6: interaction and multiclass (values: rows x features x features x classes)
+    elif task["SHAP_INTERACTIONS"] and task["OBJECTIVE"] == "multiclass":
+        # Get SHAP effects of the class
+        shap_effects = [
+            np.mean(np.abs(np.sum(k.values, axis=2)[:, :, c_class]), axis=0)
+            for k in explainations
+        ]
+        # Base value of the class
+        base = np.mean(
+            np.hstack([np.asarray(k.base_values)[:, c_class] for k in explainations])
+        )
+    # Case else
+    else:
+        # Raise error
+        raise ValueError("Unsupported task.")
+
+    # Make SHAP effects dataframe
+    shap_effects_df = pd.DataFrame(shap_effects, columns=task["x_names"])
+
+    # Return shap effects -----------------------------------------------------
+    return shap_effects_df, base
+
+
+def get_shap_values(task, explainations, c_class=-1):
+    """
+    Get SHAP values.
+
+    Parameters
+    ----------
+    task : dictionary
+        Dictionary holding the task describtion variables.
+    explainations : list of shap explaination objects
+        SHAP explaination holding the results of the ml analyses.
+    c_class : integer
+        Current class for slicing.
+
+    Returns
+    -------
+    shap_explainations : shap explaination object
+        Explaination object with SHAP values.
+    shap_base : float
+        Base value corresponds to expected value of the predictor.
+    """
+
+    # Get shap effects --------------------------------------------------------
+    # Case 1: no interaction and regression
+    if not task["SHAP_INTERACTIONS"] and task["OBJECTIVE"] == "regression":
+        # Explainer object
+        shap_explainations = Explanation(
+            np.vstack([k.values for k in explainations]),
+            base_values=np.hstack([k.base_values for k in explainations]),
+            data=np.vstack([k.data for k in explainations]),
+            display_data=None,
+            instance_names=None,
+            feature_names=explainations[0].feature_names,
+            output_names=None,
+            output_indexes=None,
+            lower_bounds=None,
+            upper_bounds=None,
+            error_std=None,
+            main_effects=None,
+            hierarchical_values=None,
+            clustering=None,
+            compute_time=_total_compute_time(explainations),
+        )
+        # Base value
+        base = np.mean(np.hstack([k.base_values for k in explainations]))
+    # Case 2: interaction and regression
+    elif task["SHAP_INTERACTIONS"] and task["OBJECTIVE"] == "regression":
+        # Explainer object
+        shap_explainations = Explanation(
+            np.vstack([k.values for k in explainations]),
+            base_values=np.hstack([k.base_values for k in explainations]),
+            data=np.vstack([k.data for k in explainations]),
+            display_data=None,
+            instance_names=None,
+            feature_names=explainations[0].feature_names,
+            output_names=None,
+            output_indexes=None,
+            lower_bounds=None,
+            upper_bounds=None,
+            error_std=None,
+            main_effects=None,
+            hierarchical_values=None,
+            clustering=None,
+            compute_time=_total_compute_time(explainations),
+        )
+        # Base value
+        base = np.mean(np.hstack([k.base_values for k in explainations]))
+    # Case 3: no interaction and binary
+    elif not task["SHAP_INTERACTIONS"] and task["OBJECTIVE"] == "binary":
+        # Explainer object
+        shap_explainations = Explanation(
+            np.vstack([k[:, :, c_class].values for k in explainations]),
+            base_values=np.hstack(
+                [k[:, :, c_class].base_values for k in explainations]
+            ),
+            data=np.vstack([k[:, :, c_class].data for k in explainations]),
+            display_data=None,
+            instance_names=None,
+            feature_names=explainations[0].feature_names,
+            output_names=None,
+            output_indexes=None,
+            lower_bounds=None,
+            upper_bounds=None,
+            error_std=None,
+            main_effects=None,
+            hierarchical_values=None,
+            clustering=None,
+            compute_time=_total_compute_time(explainations),
+        )
+        # Base value
+        base = np.mean(np.hstack([k[:, :, c_class].base_values for k in explainations]))
+    # Case 4: interaction and binary
+    elif task["SHAP_INTERACTIONS"] and task["OBJECTIVE"] == "binary":
+        # Explainer object
+        shap_explainations = Explanation(
+            np.vstack([k.values for k in explainations]),
+            base_values=np.hstack([k.base_values for k in explainations]),
+            data=np.vstack([k.data for k in explainations]),
+            display_data=None,
+            instance_names=None,
+            feature_names=explainations[0].feature_names,
+            output_names=None,
+            output_indexes=None,
+            lower_bounds=None,
+            upper_bounds=None,
+            error_std=None,
+            main_effects=None,
+            hierarchical_values=None,
+            clustering=None,
+            compute_time=_total_compute_time(explainations),
+        )
+        # Base value
+        base = np.mean(np.hstack([k.base_values for k in explainations]))
+    # Case 5: no interaction and multiclass
+    elif not task["SHAP_INTERACTIONS"] and task["OBJECTIVE"] == "multiclass":
+        # Explainer object
+        shap_explainations = Explanation(
+            np.vstack([k[:, :, c_class].values for k in explainations]),
+            base_values=np.hstack(
+                [k[:, :, c_class].base_values for k in explainations]
+            ),
+            data=np.vstack([k[:, :, c_class].data for k in explainations]),
+            display_data=None,
+            instance_names=None,
+            feature_names=explainations[0].feature_names,
+            output_names=None,
+            output_indexes=None,
+            lower_bounds=None,
+            upper_bounds=None,
+            error_std=None,
+            main_effects=None,
+            hierarchical_values=None,
+            clustering=None,
+            compute_time=_total_compute_time(explainations),
+        )
+        # Base value
+        base = np.mean(np.hstack([k[:, :, c_class].base_values for k in explainations]))
+    # Case 6: interaction and multiclass (values: rows x features x features x classes)
+    elif task["SHAP_INTERACTIONS"] and task["OBJECTIVE"] == "multiclass":
+        # Explainer object of the class
+        shap_explainations = Explanation(
+            np.vstack([np.asarray(k.values)[..., c_class] for k in explainations]),
+            base_values=np.hstack(
+                [np.asarray(k.base_values)[:, c_class] for k in explainations]
+            ),
+            data=np.vstack([k.data for k in explainations]),
+            display_data=None,
+            instance_names=None,
+            feature_names=explainations[0].feature_names,
+            output_names=None,
+            output_indexes=None,
+            lower_bounds=None,
+            upper_bounds=None,
+            error_std=None,
+            main_effects=None,
+            hierarchical_values=None,
+            clustering=None,
+            compute_time=_total_compute_time(explainations),
+        )
+        # Base value of the class
+        base = np.mean(
+            np.hstack([np.asarray(k.base_values)[:, c_class] for k in explainations])
+        )
+    # Case else
+    else:
+        # Raise error
+        raise ValueError("Unsupported task.")
+
+    # Return shap effects -----------------------------------------------------
+    return shap_explainations, base
+
+
+CORRECTIONS = ("bonferroni", "holm", "fdr_bh")
+
+
+def adjust_pvalues(p, method):
+    """
+    Adjust a family of p-values for multiple comparisons.
+
+    Parameters
+    ----------
+    p : array-like
+        P-values of one family of tests (any shape; NaN values are left
+        alone and do not count towards the family size).
+    method : {None, 'bonferroni', 'holm', 'fdr_bh'}
+        ``None``: no adjustment. ``'bonferroni'``: ``p * m``. ``'holm'``:
+        Holm's step-down procedure (controls the family-wise error rate,
+        never less powerful than Bonferroni). ``'fdr_bh'``: Benjamini and
+        Hochberg's step-up procedure (controls the false discovery rate
+        under independence or positive dependence; less conservative).
+        Adjusted values are capped at 1.
+
+    Returns
+    -------
+    ndarray
+        Adjusted p-values, same shape as ``p``.
+    """
+    p = np.asarray(p, dtype=float)
+    out = p.copy()
+    if method is None:
+        return out
+    if method not in CORRECTIONS:
+        raise ValueError(f"method must be None or one of {CORRECTIONS}, got {method!r}.")
+    flat = out.ravel()  # view
+    ok = np.isfinite(flat)
+    m = int(ok.sum())
+    if m == 0:
+        return out
+    q = flat[ok]
+    order = np.argsort(q, kind="stable")
+    ranked = q[order]
+    if method == "bonferroni":
+        adj = np.minimum(q * m, 1.0)
+    else:
+        if method == "holm":
+            step = (m - np.arange(m)) * ranked
+            ranked_adj = np.maximum.accumulate(step)
+        else:  # fdr_bh
+            step = ranked * m / np.arange(1, m + 1)
+            ranked_adj = np.minimum.accumulate(step[::-1])[::-1]
+        adj = np.empty(m)
+        adj[order] = np.minimum(ranked_adj, 1.0)
+    flat[ok] = adj
+    return flat.reshape(p.shape)
+
+
+def effect_pvalues(effects, effects_shuffled):
+    """
+    One-sided p-values that an effect is larger than that of the shuffled-target
+    model, from the corrected resampled t-test over the outer folds.
+
+    Parameters
+    ----------
+    effects, effects_shuffled : ndarray (n_folds, ...)
+        Effects of the real and the shuffled-target model per fold.
+
+    Returns
+    -------
+    ndarray
+        P-values with the shape of the trailing dimensions; NaN where fewer
+        than two folds (single train-test split) or values are not finite.
+    """
+    effects = np.asarray(effects, dtype=float)
+    diff = effects - np.asarray(effects_shuffled, dtype=float)
+    p = np.full(effects.shape[1:], np.nan)
+    if effects.shape[0] < 2:
+        return p
+    for cell in np.ndindex(*p.shape):
+        d = diff[(slice(None),) + cell]
+        if np.isfinite(d).all():
+            p[cell] = corrected_ttest(d)[1]
+    return p
+
+
+def main_shap_values(explanation, interactions):
+    """
+    Main-effect SHAP values as array (rows, features, outputs).
+
+    Interaction values are summed over the second feature axis (which gives
+    the main SHAP values); values without an outputs axis (regression) get
+    one of length 1.
+    """
+    v = np.asarray(explanation.values)
+    if interactions:
+        v = v.sum(axis=2)
+    if v.ndim == 2:
+        v = v[:, :, None]
+    return v
+
+
+def get_interaction_effects(task, explainations, c_class=0):
+    """
+    Mean absolute SHAP interaction value per outer fold.
+
+    Parameters
+    ----------
+    task : dictionary
+        Dictionary holding the task describtion variables.
+    explainations : list of shap explaination objects
+        SHAP explainations with interaction values, one per outer fold.
+    c_class : int, default 0
+        Class to use if the interaction values have a class axis
+        (multiclass targets).
+
+    Returns
+    -------
+    ndarray (n_folds, n_features, n_features)
+    """
+    arrays = []
+    for k in explainations:
+        v = np.asarray(k.values)
+        if v.ndim == 4:
+            v = v[..., c_class]
+        arrays.append(np.mean(np.abs(v), axis=0))
+    return np.array(arrays)
+
+
 RESULT_KEYS = (
     "best_params",
     "scores",

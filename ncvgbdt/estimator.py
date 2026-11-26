@@ -27,18 +27,26 @@ import numpy as np
 import pandas as pd
 from sklearn.base import BaseEstimator
 from scipy.stats import t as t_dist
+from shap import Explanation
 from sklearn.exceptions import NotFittedError
 
 from . import _json
+from .fitting import CORRECTIONS
 from .fitting import DEFAULT_SEED
 from .fitting import LOWER_IS_BETTER
+from .fitting import adjust_pvalues
 from .fitting import corrected_std
 from .fitting import corrected_ttest
+from .fitting import effect_pvalues
 from .fitting import cross_validation
 from .fitting import fit_final
 from .fitting import get_explainations
+from .fitting import get_interaction_effects
+from .fitting import get_shap_effects
+from .fitting import get_shap_values
 from .fitting import get_te_target_type
 from .fitting import get_test_groups
+from .fitting import main_shap_values
 from .fitting import metrics_for
 from .fitting import train_test_split
 
@@ -576,6 +584,35 @@ class _NCVGBDTBase(BaseEstimator):
         self._check_fitted()
         return self.results_["explainations_sh"]
 
+    def _class_slots(self):
+        """
+        ``[(label, c_class)]`` of the per-class tables: label for the tables
+        and the class index for the functions that extract effects. Binary
+        targets: the positive class only; regression: ``[(None, 0)]``.
+        """
+        classes = getattr(self, "classes_", None)
+        if classes is None:
+            return [(None, 0)]
+        if self.objective_ == "binary":
+            return [(classes[1], 0 if self.task_["SHAP_INTERACTIONS"] else 1)]
+        return [(classes[c], c) for c in range(len(classes))]
+
+    def _effect_arrays(self):
+        """
+        Per-fold SHAP effects of the real and the shuffled-target model as
+        arrays (folds, features, classes), from the same functions the
+        figures use.
+        """
+        real, shuffled = [], []
+        for _, c in self._class_slots():
+            real.append(
+                get_shap_effects(self.task_, self.explanations_, c)[0].to_numpy()
+            )
+            shuffled.append(
+                get_shap_effects(self.task_, self.explanations_shuffled_, c)[0].to_numpy()
+            )
+        return np.stack(real, axis=-1), np.stack(shuffled, axis=-1)
+
     @property
     def shap_effects_(self):
         """
@@ -587,45 +624,30 @@ class _NCVGBDTBase(BaseEstimator):
         interaction contributions of a feature.
         """
         self._check_fitted()
-        classes = getattr(self, "classes_", None)
+        names = list(self.explanations_[0].feature_names)
+        eff, eff_sh = self._effect_arrays()
+        slots = self._class_slots()
         rows = []
-        for i, (e, es) in enumerate(
-            zip(self.explanations_, self.explanations_shuffled_)
-        ):
-            a = self._effects(e)
-            b = self._effects(es)
-            for c in range(a.shape[1]):
-                label = (
-                    None
-                    if classes is None
-                    else (classes[1] if self.objective_ == "binary" else classes[c])
-                )
-                for j, f in enumerate(e.feature_names):
+        for i in range(eff.shape[0]):
+            for ci, (label, _) in enumerate(slots):
+                for j, f in enumerate(names):
                     rows.append(
                         {
                             "fold": i,
                             "class": label,
                             "feature": f,
-                            "effect": a[j, c],
-                            "effect_shuffled": b[j, c],
+                            "effect": eff[i, j, ci],
+                            "effect_shuffled": eff_sh[i, j, ci],
                         }
                     )
         return pd.DataFrame(rows)
 
     def _main_values(self, e):
         """Main-effect SHAP values as array (rows, features, outputs)."""
-        v = np.asarray(e.values)
-        if self.task_["SHAP_INTERACTIONS"]:
-            v = v.sum(axis=2)
-        elif self.objective_ == "binary":
-            v = v[:, :, 1]
-        if v.ndim == 2:
-            v = v[:, :, None]
+        v = main_shap_values(e, self.task_["SHAP_INTERACTIONS"])
+        if self.objective_ == "binary" and not self.task_["SHAP_INTERACTIONS"]:
+            v = v[:, :, 1:2]  # positive class
         return v
-
-    def _effects(self, e):
-        """Mean |SHAP| as array (features, outputs)."""
-        return np.abs(self._main_values(e)).mean(axis=0)
 
     def _mean_ci(self, arr):
         """
@@ -664,6 +686,13 @@ class _NCVGBDTBase(BaseEstimator):
           effect expected without any real relation (null reference).
         * ``effect_rel_target_sd`` (regression only): ``effect`` divided by
           the standard deviation of the target.
+        * ``p_value``: one-sided p value that the effect is larger than the
+          shuffled-model effect (corrected resampled t-test over the outer
+          folds, the test the figures use; NaN for a single train-test
+          split). ``p_value_bonferroni``, ``p_value_holm`` (step-down) and
+          ``p_value_fdr_bh`` (Benjamini-Hochberg false discovery rate) adjust
+          it for the number of predictors (per class). Folds of repeated CV
+          are not independent, so treat the p values as approximate.
         * ``slope_per_sd`` (+ interval): linear summary of the direction and
           size of the effect: slope of the SHAP values on the predictor,
           times the predictor's standard deviation, i.e. the average
@@ -679,17 +708,14 @@ class _NCVGBDTBase(BaseEstimator):
         self._check_fitted()
         names = list(self.explanations_[0].feature_names)
         nominal = set(self.task_["X_CAT_MULT_NAMES"])
-        classes = getattr(self, "classes_", None)
-        eff, eff_sh, share, slope, corr = [], [], [], [], []
-        for e, es in zip(self.explanations_, self.explanations_shuffled_):
+        slots = self._class_slots()
+        eff, eff_sh = self._effect_arrays()  # (folds, features, classes)
+        total = eff.sum(axis=1, keepdims=True)
+        share = np.where(total > 0, 100.0 * eff / np.where(total > 0, total, 1.0), np.nan)
+        slope, corr = [], []
+        for e in self.explanations_:
             v = self._main_values(e)
             n, f, c = v.shape
-            a = np.abs(v).mean(axis=0)
-            eff.append(a)
-            eff_sh.append(self._effects(es))
-            total = a.sum(axis=0, keepdims=True)
-            share.append(np.where(total > 0, 100.0 * a / np.where(
-                total > 0, total, 1.0), np.nan))
             sl = np.full((f, c), np.nan)
             co = np.full((f, c), np.nan)
             data = np.asarray(e.data)
@@ -713,20 +739,23 @@ class _NCVGBDTBase(BaseEstimator):
                         co[j, ci] = cov / (sd * ssd)
             slope.append(sl)
             corr.append(co)
-        eff, eff_sh, share, slope, corr = (
-            np.stack(x) for x in (eff, eff_sh, share, slope, corr)
-        )
+        slope, corr = np.stack(slope), np.stack(corr)
         e_mean, e_lo, e_hi = self._mean_ci(eff)
         s_mean, s_lo, s_hi = self._mean_ci(slope)
         sh_mean = self._mean_ci(share)[0]
         null_mean = self._mean_ci(eff_sh)[0]
         c_mean = self._mean_ci(corr)[0]
+        p_raw = effect_pvalues(eff, eff_sh)  # (features, classes)
+        p_adj = {
+            m: np.stack(
+                [adjust_pvalues(p_raw[:, ci], m) for ci in range(p_raw.shape[1])],
+                axis=1,
+            )
+            for m in CORRECTIONS
+        }
         rows = []
         for j, name in enumerate(names):
-            for ci in range(e_mean.shape[1]):
-                label = None
-                if classes is not None:
-                    label = classes[1] if self.objective_ == "binary" else classes[ci]
+            for ci, (label, _) in enumerate(slots):
                 row = {
                     "feature": name,
                     "class": label,
@@ -738,6 +767,9 @@ class _NCVGBDTBase(BaseEstimator):
                 }
                 if self.target_std_:
                     row["effect_rel_target_sd"] = e_mean[j, ci] / self.target_std_
+                row["p_value"] = p_raw[j, ci]
+                for m in CORRECTIONS:
+                    row[f"p_value_{m}"] = p_adj[m][j, ci]
                 row.update({
                     "slope_per_sd": s_mean[j, ci],
                     "slope_ci_low": s_lo[j, ci],
@@ -746,6 +778,153 @@ class _NCVGBDTBase(BaseEstimator):
                 })
                 rows.append(row)
         return pd.DataFrame(rows)
+
+    @property
+    def interaction_effects_(self):
+        """
+        DataFrame of pairwise SHAP interaction effects (needs
+        ``shap_interactions=True``): one row per cell of the predictor
+        matrix (``feature_a``, ``feature_b``; both orders and the diagonal
+        are included, as in the interaction figure) and, for multiclass
+        targets, class.
+
+        ``effect`` is the mean absolute interaction value (mean over the outer
+        folds), ``effect_shuffled`` the same for the shuffled-target model.
+        ``p_value`` and its adjusted versions ``p_value_bonferroni``,
+        ``p_value_holm`` and ``p_value_fdr_bh`` are as in ``effect_sizes_``;
+        the family of tests is all cells of the matrix of a class (a
+        conservative choice, since the matrix is symmetric).
+        """
+        self._check_fitted()
+        if not self.task_["SHAP_INTERACTIONS"]:
+            raise AttributeError(
+                "interaction_effects_ needs an estimator fitted with "
+                "shap_interactions=True."
+            )
+        names = list(self.explanations_[0].feature_names)
+        f = len(names)
+        rows = []
+        for label, c in self._class_slots():
+            real = get_interaction_effects(self.task_, self.explanations_, c)
+            shuf = get_interaction_effects(self.task_, self.explanations_shuffled_, c)
+            p_raw = effect_pvalues(real, shuf)
+            p_adj = {m: adjust_pvalues(p_raw, m) for m in CORRECTIONS}
+            mean, mean_sh = real.mean(axis=0), shuf.mean(axis=0)
+            for a in range(f):
+                for b in range(f):
+                    row = {
+                        "feature_a": names[a],
+                        "feature_b": names[b],
+                        "class": label,
+                        "effect": mean[a, b],
+                        "effect_shuffled": mean_sh[a, b],
+                        "p_value": p_raw[a, b],
+                    }
+                    for m in CORRECTIONS:
+                        row[f"p_value_{m}"] = p_adj[m][a, b]
+                    rows.append(row)
+        return pd.DataFrame(rows)
+
+    @property
+    def shap_values_(self):
+        """
+        Long DataFrame of the SHAP values of all explained test rows (real
+        model, main effects; with interaction values the sum over the
+        interaction partners): ``fold``, ``row`` (position among the rows
+        explained in that fold), ``class`` (None for regression; binary:
+        positive class), ``feature``, ``feature_value`` (the predictor's
+        value; float if all predictors are numeric, else object) and
+        ``shap_value``.
+        """
+        self._check_fitted()
+        names = list(self.explanations_[0].feature_names)
+        slots = self._class_slots()
+        frames = []
+        for i, e in enumerate(self.explanations_):
+            v = self._main_values(e)
+            n, f, _ = v.shape
+            data = np.asarray(e.data)
+            try:
+                data = data.astype(float)
+            except (TypeError, ValueError):
+                data = data.astype(object)
+            for ci, (label, _) in enumerate(slots):
+                frames.append(
+                    pd.DataFrame(
+                        {
+                            "fold": i,
+                            "row": np.repeat(np.arange(n), f),
+                            "class": [label] * (n * f),
+                            "feature": np.tile(names, n),
+                            "feature_value": data.ravel(),
+                            "shap_value": v[:, :, ci].ravel(),
+                        }
+                    )
+                )
+        return pd.concat(frames, ignore_index=True)
+
+    def _class_index(self, class_):
+        """Class index for ``class_`` (a label), with the defaults of the tables."""
+        classes = getattr(self, "classes_", None)
+        if classes is None:
+            if class_ is not None:
+                raise ValueError("class_ can only be used for classification.")
+            return 0
+        labels = list(classes)
+        if class_ is None:
+            if self.objective_ != "binary":
+                raise ValueError(
+                    f"class_ is required for multiclass targets; classes: {labels}."
+                )
+            return 1
+        if class_ not in labels:
+            raise ValueError(f"Unknown class_ {class_!r}; classes: {labels}.")
+        c = labels.index(class_)
+        if self.objective_ == "binary" and self.task_["SHAP_INTERACTIONS"] and c != 1:
+            raise ValueError(
+                "Interaction values of binary targets exist for the positive "
+                f"class {labels[1]!r} only."
+            )
+        return c
+
+    def shap_explanation(self, class_=None, shuffled=False, interactions=False):
+        """
+        SHAP values of all explained test rows, pooled over the outer folds,
+        as one ``shap.Explanation`` (for your own SHAP plots).
+
+        Parameters
+        ----------
+        class_ : label or None, default None
+            Class to extract (classification). Default: the positive class of
+            a binary target; required for multiclass targets.
+        shuffled : bool, default False
+            Use the shuffled-target models instead of the real ones.
+        interactions : bool, default False
+            With ``shap_interactions=True``: return the interaction values
+            (rows x features x features) instead of the main-effect values.
+
+        Returns
+        -------
+        shap.Explanation
+            ``values`` (rows, features), ``data`` the predictor values and
+            ``base_values`` per row; rows of the folds follow each other.
+        """
+        self._check_fitted()
+        if interactions and not self.task_["SHAP_INTERACTIONS"]:
+            raise ValueError("interactions=True needs shap_interactions=True.")
+        key = "explainations_sh" if shuffled else "explainations"
+        pooled, _ = get_shap_values(
+            self.task_, self.results_[key], self._class_index(class_)
+        )
+        if self.task_["SHAP_INTERACTIONS"] and not interactions:
+            pooled = Explanation(
+                np.asarray(pooled.values).sum(axis=2),
+                base_values=pooled.base_values,
+                data=pooled.data,
+                feature_names=pooled.feature_names,
+                compute_time=pooled.compute_time,
+            )
+        return pooled
 
     # ------------------------------------------------- final model (refit)
     def _require_final(self):
@@ -871,8 +1050,17 @@ class NCVGBDTRegressor(_NCVGBDTBase):
         baseline and one-sided corrected-t-test p value over the folds.
     effect_sizes_ : DataFrame
         Per predictor (and class): mean absolute SHAP effect with interval,
-        share of the total, null reference, effect relative to the target
-        sd (regression) and a standardized slope / correlation as direction.
+        share of the total, null reference, p value against the shuffled-
+        target model (also adjusted: Bonferroni, Holm, false discovery
+        rate), effect relative to the target sd (regression) and a
+        standardized slope / correlation as direction.
+    interaction_effects_ : DataFrame
+        Pairwise SHAP interaction effects with p values (needs
+        ``shap_interactions=True``).
+    shap_values_ : DataFrame
+        All explained rows: SHAP value and predictor value per row, feature
+        and class (long format). ``shap_explanation()`` returns the same
+        pooled over folds as a ``shap.Explanation``.
     score_, score_shuffled_ : float
         Mean outer-fold score of the model and of the shuffled baseline.
     shap_effects_ : DataFrame

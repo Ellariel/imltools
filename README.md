@@ -1,4 +1,4 @@
-# Interpretable Machine Learning Toolbox
+# Interpretable Machine Learning Toolbox (imltools)
 
 ## ncvgbdt
 
@@ -50,7 +50,7 @@ model.cv_results_  # scores per outer fold, real vs. shuffled targets, tuned par
 model.shap_effects_  # mean |SHAP| per fold and predictor (long format)
 model.scores_summary_  # per metric: mean, sd, interval, shuffled baseline, p value
 model.effect_sizes_  # per predictor: effect, share, direction (slope per SD)
-make_figures(model)  # figures into results/mpg/figures
+figs = make_figures(model, output_dir="results/mpg/figures")  # {name: (fig, ax)}
 
 model = load_model("results/mpg")  # later, in another session
 ```
@@ -78,7 +78,7 @@ One estimator holds one target; loop over targets and use one `output_dir` each.
 |---|---|
 | `ncvgbdt.estimator` | `NCVGBDTRegressor`, `NCVGBDTClassifier`, `load_model`, storage |
 | `ncvgbdt.fitting` | building blocks: nested CV, models, scoring, SHAP, group k-fold splitters |
-| `ncvgbdt.plotting` | `make_figures` and all figure functions |
+| `ncvgbdt.plotting` | `make_figures`, `save_figures` and all figure functions |
 
 ### Stored model (`output_dir`)
 
@@ -88,7 +88,6 @@ results/mpg/
   folds/fold_0000.json   one file per outer fold: tuned parameters, scores,
   folds/fold_0001.json   predictions and SHAP values of the real and shuffled model
   final_model.joblib     only with refit=True
-  figures/               created by make_figures
 ```
 
 - Everything except the final model is **plain JSON**: readable from any
@@ -108,6 +107,55 @@ results/mpg/
 - Fitting again with the same `output_dir` and `resume=False` removes the earlier
   results in that directory (only the files listed above). Use one directory per
   estimator.
+
+### Figures
+
+`make_figures` returns the figures instead of only writing files, so they can be
+edited afterwards:
+
+```python
+import matplotlib.pyplot as plt
+from ncvgbdt import make_figures, save_figures
+
+figs = make_figures(model)  # default: fit, SHAP effects, SHAP values
+fig, ax = figs["shap_values"]  # {name: (fig, ax)}, in drawing order
+ax.set_title("My title")
+save_figures(figs, "out", fig_format=["png", "pdf"], dpi=300)  # after editing
+plt.close("all")  # figures stay open until closed
+
+make_figures(
+    model,
+    plot_type=["fit", "dependence"],
+    figsize=(7, 4),
+    output_dir="out",
+    fig_format=["png", "svg"],
+)  # also writes files
+```
+
+- **`plot_type`** selects what is drawn: `"fit"` (predicted vs. true or confusion
+  matrix, plus violin plots against the shuffled-target baseline), `"shap_effects"`,
+  `"shap_effects_distribution"`, `"shap_values"` (beeswarm), `"dependence"`,
+  `"interaction_effects"`, `"interaction_values"` (these two need
+  `shap_interactions=True`) and `"parameters"` (tuned hyperparameters); a string,
+  a list or `"all"`. The default is the four cheap ones (`fit`, `shap_effects`,
+  `shap_effects_distribution`, `shap_values`): `dependence` and the interaction
+  types create one figure per predictor or predictor pair.
+- **Names** are stable and say what a figure is: `fit_scatter`, `fit_violin`,
+  `shap_values`, `dependence:wt`, `interaction_values:a:b`; per-class figures end
+  in `:class_<label>` (binary: class 0 mirrors class 1; multiclass with
+  interaction values: all SHAP figures are drawn per class). `classes=[...]`
+  restricts the classes.
+- **`figsize`**: `None` (defaults), one `(width, height)` for all figures, or a dict
+  per plot type. **`plot_kwargs`**: keyword arguments for the drawing call of a
+  figure kind (e.g. `{"fit_scatter": {"alpha": .5}, "shap_values": {"max_display": 5}}`);
+  the allowed keys are listed in `help(make_figures)`.
+- **Saving:** nothing is written unless `output_dir` is given (or `save_figures` is
+  called). `fig_format` is `"png"`, `"svg"`, `"pdf"` or a list; `dpi` applies to PNG.
+  Files are named after the figure (`dependence:wt` becomes `dependence__wt.png`), so
+  use one directory per estimator.
+- **Open figures:** matplotlib keeps every pyplot figure open (and warns above 20);
+  `plot_type="all"` can create dozens. Close them with `plt.close("all")`. In a
+  notebook the inline backend shows every returned figure at the end of the cell.
 
 ## Method in brief
 
@@ -380,10 +428,12 @@ give identical results (tested).
   relative size, null reference, standardized slope and correlation as direction).
 - **Binary SHAP layout:** main-effect values carry a class axis (class 0 is the
   mirror of class 1) so that the figures treat binary and multiclass alike.
-- **Figures:** `make_figures` takes a fitted estimator or its directory. The
-  plotting code stems from the earlier upstream version and was **not synced with
-  upstream's later rewrite of `iml_3_plt.py`**, so the set and look of the figures
-  differ; adjusted for current library versions (pandas 3) and the new layout.
+- **Figures:** `make_figures` takes a fitted estimator or its directory, returns
+  `{name: (fig, ax)}` for editing, chooses figures with `plot_type`, and writes files
+  only on request (`output_dir`, `fig_format`, `dpi`). The plotting code stems from
+  the earlier upstream version and was **not synced with upstream's later rewrite of
+  `iml_3_plt.py`**, so the set and look of the figures differ; adjusted for current
+  library versions (pandas 3) and the new layout.
 
 ### Not supported or not ported
 - **Missing values:** as upstream, missing predictor values are left to LightGBM by

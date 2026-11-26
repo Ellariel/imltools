@@ -3,7 +3,6 @@ resuming and the final model (refit)."""
 import json
 import shutil
 import warnings
-from pathlib import Path
 
 import numpy as np
 import pandas as pd
@@ -231,8 +230,8 @@ def test_load_restores_everything_exactly(fitted, data):
     np.testing.assert_allclose(loaded.predict(data.head(10)),
                                m.predict(data.head(10)))
     # figures from the loaded estimator and straight from the directory
-    out = make_figures(d, figures_dir=d / 'figs')
-    assert len(list(Path(out).glob('*.png'))) >= 8
+    figs = make_figures(d, output_dir=d / 'figs')
+    assert 'fit_scatter' in figs and (d / 'figs' / 'fit_scatter.png').exists()
 
 
 def test_load_wrong_class_and_missing_dir(fitted, tmp_path):

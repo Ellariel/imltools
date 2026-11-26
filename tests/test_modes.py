@@ -4,7 +4,6 @@ Fast unit tests first, slower end-to-end runs (fit + figures) afterwards. All
 data is synthetic, no network access is needed.
 """
 import warnings
-from pathlib import Path
 
 import numpy as np
 import pandas as pd
@@ -52,18 +51,16 @@ def test_class_weights_are_inverse_frequency():
     assert set(get_class_w(np.array([0, 1, 2] * 5)).values()) == {1.0}
 
 
-def test_figure_file_names_are_not_cut_by_the_directory():
-    """File names used to be truncated together with the directory, so long
-    output paths made different figures overwrite each other."""
-    from ncvgbdt.plotting import _save_path
-    long_dir = '/very/long/' + 'x' * 200
-    a = _save_path(long_dir, 'analysis_CV_5_y_class_0_shap_effects')
-    b = _save_path(long_dir, 'analysis_CV_5_y_class_1_shap_effects')
-    assert a.startswith(long_dir + '/') and a != b
-    # a very long file name is shortened, but stays unique
-    c = _save_path('d', 'z' * 300 + 'a')
-    d = _save_path('d', 'z' * 300 + 'b')
-    assert len(c) < 140 and c != d
+def test_figure_file_names():
+    """File names come from the figure names only (the directory is never
+    cut); illegal characters are replaced and long names stay unique."""
+    from ncvgbdt.plotting import _file_stem
+    assert _file_stem('dependence:wt:class_1') == 'dependence__wt__class_1'
+    assert _file_stem('shap_effects:class_0') != _file_stem('shap_effects:class_1')
+    assert not set('/\\?*<>|"') & set(_file_stem('dependence:a/b?c*d'))
+    long_a = _file_stem('z' * 300 + 'a')
+    long_b = _file_stem('z' * 300 + 'b')
+    assert len(long_a) <= 120 and long_a != long_b
 
 
 def test_te_target_type():
@@ -251,8 +248,13 @@ def test_multiclass_target_encoding_and_shap(multiclass_run):
 
 def test_multiclass_figures(multiclass_run):
     d, model = multiclass_run
-    out = make_figures(model, figures_dir=d / 'figs')
-    assert len(list(Path(out).glob('*.png'))) >= 10
+    figs = make_figures(model, plot_type='all', output_dir=d / 'figs')
+    assert 'fit_confusion' in figs and 'fit_violin' in figs
+    for label in model.classes_:
+        assert f'shap_effects:class_{label}' in figs
+        assert f'dependence:a:class_{label}' in figs
+    # every figure is saved under its own name
+    assert len(list((d / 'figs').glob('*.png'))) == len(figs)
 
 
 def test_binary_grouped_train_test_split_with_interactions(data, tmp_path):
@@ -270,8 +272,9 @@ def test_binary_grouped_train_test_split_with_interactions(data, tmp_path):
     assert list(model.classes_) == [0, 1]
     # binary interactions: (n, features, features)
     assert model.explanations_[0].values.shape[1:] == (3, 3)
-    out = make_figures(model, figures_dir=tmp_path / 'figs')
-    assert len(list(Path(out).glob('*.png'))) >= 5
+    figs = make_figures(model, plot_type='all', output_dir=tmp_path / 'figs')
+    assert 'interaction_effects' in figs and 'interaction_values:a:b' in figs
+    assert len(list((tmp_path / 'figs').glob('*.png'))) == len(figs)
 
 
 def test_default_arguments_run(data):
@@ -337,8 +340,9 @@ def test_missing_predictors_native_mode(data, tmp_path):
     np.testing.assert_array_equal(
         np.isnan(np.asarray(loaded.explanations_[0].data, dtype=float)),
         np.isnan(shown))
-    out = make_figures(loaded, figures_dir=tmp_path / 'figs')
-    assert len(list(Path(out).glob('*.png'))) >= 10
+    figs = make_figures(loaded, plot_type='all', output_dir=tmp_path / 'figs')
+    assert len(figs) >= 10
+    assert len(list((tmp_path / 'figs').glob('*.png'))) == len(figs)
 
 
 def test_multiclass_shap_interactions(data, tmp_path):
@@ -360,8 +364,8 @@ def test_multiclass_shap_interactions(data, tmp_path):
     np.testing.assert_allclose(a['effect'], b['effect'], atol=1e-8)
     assert len(inter.effect_sizes_) == 3 * 3
     # one set of SHAP figures per class
-    out = make_figures(inter, figures_dir=tmp_path / 'figs')
-    names = [p.name for p in Path(out).glob('*.png')]
+    figs = make_figures(inter, plot_type='all', output_dir=tmp_path / 'figs')
     for label in inter.classes_:
-        assert any(f'_class_{label}_' in n and 'inter' in n for n in names)
-    assert len(names) >= 3 * 10
+        for kind in ('shap_effects', 'shap_values', 'interaction_effects',
+                     'dependence:a', 'interaction_values:a:b'):
+            assert f'{kind}:class_{label}' in figs

@@ -7,7 +7,7 @@ Typical use::
     model = NCVGBDTRegressor(x_con_names=['wt'], output_dir='out')
     model.fit(df, df['mpg'], groups=None)
     print(model.cv_results_, model.shap_effects_)
-    make_figures(model)
+    figs = make_figures(model)   # {name: (fig, ax)}, edit, then save_figures
 
     # later
     from ncvgbdt import load_model
@@ -24,6 +24,7 @@ from .estimator import NCVGBDTClassifier
 from .estimator import NCVGBDTRegressor
 from .estimator import load_model
 from .plotting import make_figures
+from .plotting import save_figures
 
 try:
     __version__ = version('imltools')  # name of the installed distribution
@@ -31,4 +32,4 @@ except PackageNotFoundError:  # running from a source tree that is not installed
     __version__ = 'unknown'
 
 __all__ = ['NCVGBDTRegressor', 'NCVGBDTClassifier', 'load_model',
-           'make_figures', '__version__']
+           'make_figures', 'save_figures', '__version__']

@@ -2,9 +2,10 @@
 Plotting of the results of a fitted :class:`ncvgbdt.NCVGBDTRegressor` /
 :class:`ncvgbdt.NCVGBDTClassifier`.
 
-The single public entry point is :func:`make_figures`. It takes a fitted
-estimator or the directory of a stored one and writes figures (PNG,
-optionally SVG).
+:func:`make_figures` takes a fitted estimator or the directory of a stored one
+and returns the figures as ``{name: (fig, ax)}``, so that they can be edited;
+:func:`save_figures` writes them as PNG, SVG or PDF files (``make_figures``
+does this itself if given an ``output_dir``).
 
 See the package README for design choices and caveats relevant for
 interpreting the figures (shuffled-target baseline, corrected t-test,
@@ -13,6 +14,7 @@ SHAP effects, ...).
 
 import hashlib
 import os
+import re
 from itertools import permutations
 
 import matplotlib.pyplot as plt
@@ -27,23 +29,114 @@ from sklearn.metrics import confusion_matrix
 
 from .fitting import corrected_std  # noqa: F401
 from .fitting import corrected_ttest
-from .fitting import create_dir
 
 from .format import format_p, format_r, get_stars
 
 
-def _save_path(plots_path, stem, max_len=120):
-    """
-    Path (without extension) of a figure file in ``plots_path``.
+PLOT_TYPES = (
+    "fit",
+    "shap_effects",
+    "shap_effects_distribution",
+    "shap_values",
+    "dependence",
+    "interaction_effects",
+    "interaction_values",
+    "parameters",
+)
+DEFAULT_PLOT_TYPES = ("fit", "shap_effects", "shap_effects_distribution", "shap_values")
+INTERACTION_PLOT_TYPES = ("interaction_effects", "interaction_values")
+# Figure kinds whose drawing call accepts keyword arguments from ``plot_kwargs``
+PLOT_KWARGS_KINDS = (
+    "fit_scatter",
+    "fit_violin",
+    "fit_confusion",
+    "shap_effects",
+    "shap_effects_distribution",
+    "shap_values",
+    "dependence",
+    "interaction_effects",
+    "interaction_values",
+    "parameters",
+)
+FIG_FORMATS = ("png", "svg", "pdf")
 
-    Only the file name is shortened (to ``max_len`` characters, with a short
-    hash of the full name so that different long names stay different); the
-    directory is never cut.
+
+class _Figures:
+    """Collects the figures of one :func:`make_figures` call."""
+
+    def __init__(self, figsize=None, plot_kwargs=None):
+        self.figures = {}
+        self.figsize = figsize
+        self.plot_kwargs = plot_kwargs or {}
+
+    def kwargs(self, kind):
+        """Keyword arguments the user gave for a figure kind (a copy)."""
+        return dict(self.plot_kwargs.get(kind, {}))
+
+    def add(self, name, plot_type, fig, ax):
+        """Register a finished figure under ``name``."""
+        if name in self.figures:
+            raise ValueError(f"Duplicate figure name {name!r}.")
+        size = self.figsize
+        if isinstance(size, dict):
+            size = size.get(plot_type)
+        if size is not None:
+            fig.set_size_inches(*size)
+        self.figures[name] = (fig, ax)
+
+
+def _call(fn, user, *args, **defaults):
+    """Call ``fn``; keyword arguments in ``user`` override ``defaults``."""
+    return fn(*args, **{**defaults, **user})
+
+
+def _shap_call(fn, user, *args, **defaults):
     """
+    Like :func:`_call` for SHAP plots, which draw into the *current* axes.
+    Start from a fresh figure so that earlier (still open) figures are not
+    drawn over.
+    """
+    fresh = plt.figure()
+    result = _call(fn, user, *args, **defaults)
+    if plt.gcf() is not fresh:  # the function made its own figure
+        plt.close(fresh)
+    return result
+
+
+def _name(task, base, c_class=None):
+    """
+    Figure name: ``base`` plus ``:class_<label>`` for per-class figures.
+    """
+    name = base + task.get("NAME_SUFFIX", "")
+    if (
+        c_class is not None
+        and not task["SHAP_INTERACTIONS"]
+        and task["OBJECTIVE"] in ("binary", "multiclass")
+    ):
+        labels = task.get("CLASS_LABELS")
+        name += f":class_{c_class if labels is None else labels[c_class]}"
+    return name
+
+
+def _class_loop(task, n_classes):
+    """Class indices to draw (all, or those chosen with ``classes``)."""
+    select = task.get("CLASS_SELECT")
+    if select is None or n_classes == 1:
+        return range(n_classes)
+    return [c for c in range(n_classes) if c in select]
+
+
+def _file_stem(name, max_len=120):
+    """
+    File name (without extension) for a figure name: characters that are not
+    allowed in file names are replaced, and a very long name is shortened
+    (with a short hash, so that different long names stay different).
+    """
+    stem = re.sub(r"[^\w.+=,() -]", "_", name.replace(":", "__"))
     if len(stem) > max_len:
-        digest = hashlib.md5(stem.encode("utf-8")).hexdigest()[:8]
+        digest = hashlib.md5(name.encode("utf-8")).hexdigest()[:8]
         stem = stem[: max_len - 9] + "_" + digest
-    return plots_path + "/" + stem
+    return stem
 
 
 def _total_compute_time(explainations):
@@ -51,7 +144,7 @@ def _total_compute_time(explainations):
     return float(np.sum([k.compute_time or 0 for k in explainations]))
 
 
-def print_parameter_distributions(task, results, plots_path):
+def print_parameter_distributions(task, results, figs):
     """
     Print model parameter distributions in histogram.
 
@@ -61,8 +154,8 @@ def print_parameter_distributions(task, results, plots_path):
         Dictionary holding the task describtion variables.
     results : dictionary
         Dictionary holding the results of the ml analyses.
-    plots_path : string
-        Path to the plots.
+    figs : _Figures
+        Collector that receives the finished figures.
 
     Returns
     -------
@@ -79,7 +172,7 @@ def print_parameter_distributions(task, results, plots_path):
         # Make figure
         fig, ax = plt.subplots(figsize=(8, 5))
         # Plot hist of inlier score
-        sns.histplot(
+        _call(sns.histplot, figs.kwargs("parameters"), 
             data=data.astype("float"), bins=30, kde=True, color="#777777", ax=ax
         )
         # Remove top, right and left frame elements
@@ -101,33 +194,13 @@ def print_parameter_distributions(task, results, plots_path):
 
         # Save figure ---------------------------------------------------------
         # Make save path
-        save_path = _save_path(
-            plots_path,
-            task["ANALYSIS_NAME"]
-            + "_"
-            + "0"
-            + "_"
-            + task["y_name"][0]
-            + "_"
-            + "hyperparameter"
-            + "_"
-            + name,
-        )
-        # Save figure
-        plt.savefig(save_path + ".png", dpi=150, bbox_inches="tight")
-        # Check if save as svg is enabled
-        if task["AS_SVG"]:
-            # Save figure
-            plt.savefig(save_path + ".svg", bbox_inches="tight")
-        # Show figure
-        # plt.show()
-        plt.close()
+        figs.add(f"parameters:{name}", "parameters", fig, ax)
 
     # Return None -------------------------------------------------------------
     return fig
 
 
-def print_regression_scatter(task, results, plots_path):
+def print_regression_scatter(task, results, figs):
     """
     Print model fit in a scatter plot (regression).
 
@@ -137,8 +210,8 @@ def print_regression_scatter(task, results, plots_path):
         Dictionary holding the task describtion variables.
     results : dictionary
         Dictionary holding the results of the ml analyses.
-    plots_path : string
-        Path to the plots.
+    figs : _Figures
+        Collector that receives the finished figures.
 
     Returns
     -------
@@ -155,7 +228,7 @@ def print_regression_scatter(task, results, plots_path):
     # Make figure
     fig, ax = plt.subplots(figsize=(8, 8))
     # Print data
-    ax.scatter(pred_values, true_values, zorder=2, alpha=0.1, color="#444444")
+    _call(ax.scatter, figs.kwargs("fit_scatter"), pred_values, true_values, zorder=2, alpha=0.1, color="#444444")
     # Add optimal fit line
     ax.plot(
         [-10000, 10000],
@@ -286,24 +359,13 @@ def print_regression_scatter(task, results, plots_path):
 
     # Save figure -------------------------------------------------------------
     # Make save path
-    save_path = _save_path(
-        plots_path, task["ANALYSIS_NAME"] + "_" + "1" + "_" + task["y_name"][0]
-    )
-    # Save figure
-    plt.savefig(save_path + ".png", dpi=150, bbox_inches="tight")
-    # Check if save as svg is enabled
-    if task["AS_SVG"]:
-        # Save figure
-        plt.savefig(save_path + ".svg", bbox_inches="tight")
-    # Show figure
-    # plt.show()
-    plt.close()
+    figs.add("fit_scatter", "fit", fig, ax)
 
     # Return None -------------------------------------------------------------
     return fig
 
 
-def print_regression_violin(task, results, plots_path):
+def print_regression_violin(task, results, figs):
     """
     Print model fit in a violin plot (regression).
 
@@ -313,8 +375,8 @@ def print_regression_violin(task, results, plots_path):
         Dictionary holding the task describtion variables.
     results : dictionary
         Dictionary holding the results of the ml analyses.
-    plots_path : string
-        Path to the plots.
+    figs : _Figures
+        Collector that receives the finished figures.
 
     Returns
     -------
@@ -363,7 +425,7 @@ def print_regression_violin(task, results, plots_path):
     # Loop over metrics
     for i, metric in enumerate(metrics):
         # Plot data
-        sns.violinplot(
+        _call(sns.violinplot, figs.kwargs("fit_violin"), 
             x=metric,
             y="Dummy",
             hue="Data",
@@ -414,31 +476,13 @@ def print_regression_violin(task, results, plots_path):
 
     # Save figure -------------------------------------------------------------
     # Make save path
-    save_path = _save_path(
-        plots_path,
-        task["ANALYSIS_NAME"]
-        + "_"
-        + "1"
-        + "_"
-        + task["y_name"][0]
-        + "_"
-        + "distribution",
-    )
-    # Save figure
-    plt.savefig(save_path + ".png", dpi=150, bbox_inches="tight")
-    # Check if save as svg is enabled
-    if task["AS_SVG"]:
-        # Save figure
-        plt.savefig(save_path + ".svg", bbox_inches="tight")
-    # Show plot
-    # plt.show()
-    plt.close()
+    figs.add("fit_violin", "fit", fig, ax)
 
     # Return None -------------------------------------------------------------
     return fig
 
 
-def print_classification_confusion(task, results, plots_path):
+def print_classification_confusion(task, results, figs):
     """
     Print model fit as confusion matrix (classification).
 
@@ -448,8 +492,8 @@ def print_classification_confusion(task, results, plots_path):
         Dictionary holding the task describtion variables.
     results : dictionary
         Dictionary holding the results of the ml analyses.
-    plots_path : string
-        Path to the plots.
+    figs : _Figures
+        Collector that receives the finished figures.
 
     Returns
     -------
@@ -503,7 +547,7 @@ def print_classification_confusion(task, results, plots_path):
         figsize=(con_mat.shape[0] * 0.5 + 3, con_mat.shape[0] * 0.5 + 3)
     )
     # Plot confusion matrix
-    sns.heatmap(
+    _call(sns.heatmap, figs.kwargs("fit_confusion"), 
         con_mat_norm * 100,
         vmin=None,
         vmax=None,
@@ -567,24 +611,13 @@ def print_classification_confusion(task, results, plots_path):
 
     # Save figure -------------------------------------------------------------
     # Make save path
-    save_path = _save_path(
-        plots_path, task["ANALYSIS_NAME"] + "_" + "1" + "_" + task["y_name"][0]
-    )
-    # Save figure
-    plt.savefig(save_path + ".png", dpi=150, bbox_inches="tight")
-    # Check if save as svg is enabled
-    if task["AS_SVG"]:
-        # Save figure
-        plt.savefig(save_path + ".svg", bbox_inches="tight")
-    # Show figure
-    # plt.show()
-    plt.close()
+    figs.add("fit_confusion", "fit", fig, ax)
 
     # Return None -------------------------------------------------------------
     return fig
 
 
-def print_classification_violin(task, results, plots_path):
+def print_classification_violin(task, results, figs):
     """
     Print model fit in a violin plot (classification).
 
@@ -594,8 +627,8 @@ def print_classification_violin(task, results, plots_path):
         Dictionary holding the task describtion variables.
     results : dictionary
         Dictionary holding the results of the ml analyses.
-    plots_path : string
-        Path to the plots.
+    figs : _Figures
+        Collector that receives the finished figures.
 
     Returns
     -------
@@ -638,7 +671,7 @@ def print_classification_violin(task, results, plots_path):
     # Loop over metrics
     for i, metric in enumerate(metrics):
         # Plot data
-        sns.violinplot(
+        _call(sns.violinplot, figs.kwargs("fit_violin"), 
             x=metric,
             y="Dummy",
             hue="Data",
@@ -689,25 +722,7 @@ def print_classification_violin(task, results, plots_path):
 
     # Save figure -------------------------------------------------------------
     # Make save path
-    save_path = _save_path(
-        plots_path,
-        task["ANALYSIS_NAME"]
-        + "_"
-        + "1"
-        + "_"
-        + task["y_name"][0]
-        + "_"
-        + "distribution",
-    )
-    # Save figure
-    plt.savefig(save_path + ".png", dpi=150, bbox_inches="tight")
-    # Check if save as svg is enabled
-    if task["AS_SVG"]:
-        # Save figure
-        plt.savefig(save_path + ".svg", bbox_inches="tight")
-    # Show plot
-    # plt.show()
-    plt.close()
+    figs.add("fit_violin", "fit", fig, ax)
 
     # Return None -------------------------------------------------------------
     return fig
@@ -793,7 +808,7 @@ def get_shap_effects(task, explainations, c_class=-1):
     return shap_effects_df, base
 
 
-def print_shap_effects(task, results, plots_path):
+def print_shap_effects(task, results, figs):
     """
     Print SHAP based global effects.
 
@@ -803,8 +818,8 @@ def print_shap_effects(task, results, plots_path):
         Dictionary holding the task describtion variables.
     results : dictionary
         Dictionary holding the results of the ml analyses.
-    plots_path : string
-        Path to the plots.
+    figs : _Figures
+        Collector that receives the finished figures.
 
     Returns
     -------
@@ -824,7 +839,7 @@ def print_shap_effects(task, results, plots_path):
 
     # Plot shap effects -------------------------------------------------------
     # Loop over classes
-    for c_class in range(n_classes):
+    for c_class in _class_loop(task, n_classes):
         # Get current shap effects
         shap_effects_df, base = get_shap_effects(
             task, results["explainations"], c_class
@@ -847,15 +862,19 @@ def print_shap_effects(task, results, plots_path):
         x_names_count = len(task["x_names"])
 
         # Plot ----------------------------------------------------------------
+        # Make figure (own axes: pandas would otherwise draw on the current figure)
+        fig, ax = plt.subplots(
+            figsize=(x_names_max_len * 0.1 + 7, x_names_count * 0.4 + 1)
+        )
         # Make horizontal bar plot
-        shap_effects_se_mean_sort.plot(
+        _call(
+            shap_effects_se_mean_sort.plot,
+            figs.kwargs("shap_effects"),
             kind="barh",
-            figsize=(x_names_max_len * 0.1 + 7, x_names_count * 0.4 + 1),
+            ax=ax,
             color="#777777",
             fontsize=10,
         )
-        # Get the current figure and axes objects.
-        fig, ax = plt.gcf(), plt.gca()
         # Set x label size
         plt.xlabel("mean(|SHAP values|)", fontsize=10)
         # Set x ticks size
@@ -932,37 +951,13 @@ def print_shap_effects(task, results, plots_path):
 
         # Save plot -----------------------------------------------------------
         # Make save path
-        save_path = _save_path(
-            plots_path,
-            task["ANALYSIS_NAME"]
-            + "_"
-            + "2"
-            + "_"
-            + task["y_name"][0]
-            + "_"
-            + "shap_effects",
-        )
-        # Add class if no interactions and binary or multiclass
-        if not task["SHAP_INTERACTIONS"] and (
-            task["OBJECTIVE"] == "binary" or task["OBJECTIVE"] == "multiclass"
-        ):
-            # Make title string
-            save_path = save_path + "_class_" + str(c_class)
-        # Save figure
-        plt.savefig(save_path + ".png", dpi=150, bbox_inches="tight")
-        # Check if save as svg is enabled
-        if task["AS_SVG"]:
-            # Save figure
-            plt.savefig(save_path + ".svg", bbox_inches="tight")
-        # Show figure
-        # plt.show()
-        plt.close()
+        figs.add(_name(task, "shap_effects", c_class), "shap_effects", fig, ax)
 
     # Return None -------------------------------------------------------------
     return fig
 
 
-def print_shap_effects_distribution(task, results, plots_path):
+def print_shap_effects_distribution(task, results, figs):
     """
     Print SHAP values distribution.
 
@@ -972,8 +967,8 @@ def print_shap_effects_distribution(task, results, plots_path):
         Dictionary holding the task describtion variables.
     results : dictionary
         Dictionary holding the results of the ml analyses.
-    plots_path : string
-        Path to the plots.
+    figs : _Figures
+        Collector that receives the finished figures.
 
     Returns
     -------
@@ -993,7 +988,7 @@ def print_shap_effects_distribution(task, results, plots_path):
 
     # Plot shap effects distribution ------------------------------------------
     # Loop over classes
-    for c_class in range(n_classes):
+    for c_class in _class_loop(task, n_classes):
         # Get current shap effects
         shap_effects_df, base = get_shap_effects(
             task, results["explainations"], c_class
@@ -1048,7 +1043,7 @@ def print_shap_effects_distribution(task, results, plots_path):
         # Make color palette
         mypal = {"original": "#777777", "shuffle": "#eeeeee"}
         # Plot data
-        sns.violinplot(
+        _call(sns.violinplot, figs.kwargs("shap_effects_distribution"), 
             x=value_name,
             y="predictors",
             hue="Data",
@@ -1066,7 +1061,7 @@ def print_shap_effects_distribution(task, results, plots_path):
             palette=mypal,
         )
         # Get the current figure and axes objects.
-        _, ax = plt.gcf(), plt.gca()
+        fig, ax = plt.gcf(), plt.gca()
         # Set x label size
         plt.xlabel("mean(|SHAP values|)", fontsize=10)
         # Set x ticks size
@@ -1108,31 +1103,7 @@ def print_shap_effects_distribution(task, results, plots_path):
 
         # Save plots and results ----------------------------------------------
         # Make save path
-        save_path = _save_path(
-            plots_path,
-            task["ANALYSIS_NAME"]
-            + "_"
-            + "2"
-            + "_"
-            + task["y_name"][0]
-            + "_"
-            + "shap_effects_distribution",
-        )
-        # Add class if no interactions and binary or multiclass
-        if not task["SHAP_INTERACTIONS"] and (
-            task["OBJECTIVE"] == "binary" or task["OBJECTIVE"] == "multiclass"
-        ):
-            # Make title string
-            save_path = save_path + "_class_" + str(c_class)
-        # Save figure
-        plt.savefig(save_path + ".png", dpi=150, bbox_inches="tight")
-        # Check if save as svg is enabled
-        if task["AS_SVG"]:
-            # Save figure
-            plt.savefig(save_path + ".svg", bbox_inches="tight")
-        # Show figure
-        # plt.show()
-        plt.close()
+        figs.add(_name(task, "shap_effects_distribution", c_class), "shap_effects_distribution", fig, ax)
 
     # Return None -------------------------------------------------------------
     return fig
@@ -1305,7 +1276,7 @@ def get_shap_values(task, explainations, c_class=-1):
     return shap_explainations, base
 
 
-def print_shap_values(task, results, plots_path):
+def print_shap_values(task, results, figs):
     """
     Plot SHAP values.
 
@@ -1315,8 +1286,8 @@ def print_shap_values(task, results, plots_path):
         Dictionary holding the task describtion variables.
     results : dictionary
         Dictionary holding the results of the ml analyses.
-    plots_path : string
-        Path to the plots.
+    figs : _Figures
+        Collector that receives the finished figures.
 
     Returns
     -------
@@ -1336,7 +1307,7 @@ def print_shap_values(task, results, plots_path):
 
     # Plot shap values --------------------------------------------------------
     # Loop over classes
-    for c_class in range(n_classes):
+    for c_class in _class_loop(task, n_classes):
         # Get current shap values
         shap_values, base = get_shap_values(task, results["explainations"], c_class)
 
@@ -1359,7 +1330,7 @@ def print_shap_values(task, results, plots_path):
         x_names_count = len(task["x_names"])
 
         # Plot SHAP values beeswarm -------------------------------------------
-        beeswarm(
+        _shap_call(beeswarm, figs.kwargs("shap_values"), 
             shap_explainations,
             max_display=len(task["x_names"]),
             order=Explanation.abs.mean(0),
@@ -1414,37 +1385,13 @@ def print_shap_values(task, results, plots_path):
 
         # Save plot -----------------------------------------------------------
         # Make save path
-        save_path = _save_path(
-            plots_path,
-            task["ANALYSIS_NAME"]
-            + "_"
-            + "3"
-            + "_"
-            + task["y_name"][0]
-            + "_"
-            + "shap_values",
-        )
-        # Add class if no interactions and binary or multiclass
-        if not task["SHAP_INTERACTIONS"] and (
-            task["OBJECTIVE"] == "binary" or task["OBJECTIVE"] == "multiclass"
-        ):
-            # Make title string
-            save_path = save_path + "_class_" + str(c_class)
-        # Save figure
-        plt.savefig(save_path + ".png", dpi=150, bbox_inches="tight")
-        # Check if save as svg is enabled
-        if task["AS_SVG"]:
-            # Save figure
-            plt.savefig(save_path + ".svg", bbox_inches="tight")
-        # Show figure
-        # plt.show()
-        plt.close()
+        figs.add(_name(task, "shap_values", c_class), "shap_values", fig, ax)
 
     # Return None -------------------------------------------------------------
     return fig
 
 
-def print_shap_dependences(task, results, plots_path):
+def print_shap_dependences(task, results, figs):
     """
     Plot SHAP dependences.
 
@@ -1454,8 +1401,8 @@ def print_shap_dependences(task, results, plots_path):
         Dictionary holding the task describtion variables.
     results : dictionary
         Dictionary holding the results of the ml analyses.
-    plots_path : string
-        Path to the plots.
+    figs : _Figures
+        Collector that receives the finished figures.
 
     Returns
     -------
@@ -1475,7 +1422,7 @@ def print_shap_dependences(task, results, plots_path):
 
     # Plot shap values --------------------------------------------------------
     # Loop over classes
-    for c_class in range(n_classes):
+    for c_class in _class_loop(task, n_classes):
         # Get current shap values
         shap_values, base = get_shap_values(task, results["explainations"], c_class)
         # If interactions
@@ -1496,7 +1443,7 @@ def print_shap_dependences(task, results, plots_path):
             # Make figure
             fig, ax = plt.subplots(figsize=(8, 5))
             # Plot SHAP Scatter plot
-            scatter(
+            _call(scatter, figs.kwargs("dependence"), 
                 shap_explainations[:, i],
                 color="#777777",
                 hist=True,
@@ -1515,7 +1462,7 @@ def print_shap_dependences(task, results, plots_path):
                 show=False,
             )
             # Get the current figure and axes objects.
-            _, ax = plt.gcf(), plt.gca()
+            fig, ax = plt.gcf(), plt.gca()
             # Set x label size
             plt.xlabel(ax.get_xlabel(), fontsize=10)
             # Set x ticks size
@@ -1547,39 +1494,13 @@ def print_shap_dependences(task, results, plots_path):
 
             # Save plot -------------------------------------------------------
             # Make save path
-            save_path = _save_path(
-                plots_path,
-                task["ANALYSIS_NAME"]
-                + "_"
-                + "4"
-                + "_"
-                + task["y_name"][0]
-                + "_"
-                + "shap_values_dependency"
-                + "_"
-                + str(c_pred),
-            )
-            # Add class if no interactions and binary or multiclass
-            if not task["SHAP_INTERACTIONS"] and (
-                task["OBJECTIVE"] == "binary" or task["OBJECTIVE"] == "multiclass"
-            ):
-                # Make title string
-                save_path = save_path + "_class_" + str(c_class)
-            # Save figure
-            plt.savefig(save_path + ".png", dpi=150, bbox_inches="tight")
-            # Check if save as svg is enabled
-            if task["AS_SVG"]:
-                # Save figure
-                plt.savefig(save_path + ".svg", bbox_inches="tight")
-            # Show figure
-            # plt.show()
-            plt.close()
+            figs.add(_name(task, f"dependence:{c_pred}", c_class), "dependence", fig, ax)
 
     # Return None -------------------------------------------------------------
     return fig
 
 
-def print_shap_effects_interactions(task, results, plots_path):
+def print_shap_effects_interactions(task, results, figs):
     """
     Plot SHAP effects inclusive interactions.
 
@@ -1589,8 +1510,8 @@ def print_shap_effects_interactions(task, results, plots_path):
         Dictionary holding the task describtion variables.
     results : dictionary
         Dictionary holding the results of the ml analyses.
-    plots_path : string
-        Path to the plots.
+    figs : _Figures
+        Collector that receives the finished figures.
 
     Returns
     -------
@@ -1610,7 +1531,7 @@ def print_shap_effects_interactions(task, results, plots_path):
 
     # Plot shap effects -------------------------------------------------------
     # Loop over classes
-    for c_class in range(n_classes):
+    for c_class in _class_loop(task, n_classes):
         # Get current shap effects
         shap_effects_df, base = get_shap_effects(
             task, results["explainations"], c_class
@@ -1712,7 +1633,7 @@ def print_shap_effects_interactions(task, results, plots_path):
         # Make colorbar string
         clb_str = "mean(|SHAP value|)"
         # Plot confusion matrix
-        sns.heatmap(
+        _call(sns.heatmap, figs.kwargs("interaction_effects"), 
             shap_effects_inter_sort_df,
             vmin=None,
             vmax=None,
@@ -1779,37 +1700,13 @@ def print_shap_effects_interactions(task, results, plots_path):
 
         # Save plot -----------------------------------------------------------
         # Make save path
-        save_path = _save_path(
-            plots_path,
-            task["ANALYSIS_NAME"]
-            + "_"
-            + "5"
-            + "_"
-            + task["y_name"][0]
-            + "_"
-            + "shap_effects_interactions",
-        )
-        # Add class if no interactions and binary or multiclass
-        if not task["SHAP_INTERACTIONS"] and (
-            task["OBJECTIVE"] == "binary" or task["OBJECTIVE"] == "multiclass"
-        ):
-            # Make title string
-            save_path = save_path + "_class_" + str(c_class)
-        # Save figure
-        plt.savefig(save_path + ".png", dpi=150, bbox_inches="tight")
-        # Check if save as svg is enabled
-        if task["AS_SVG"]:
-            # Save figure
-            plt.savefig(save_path + ".svg", bbox_inches="tight")
-        # Show figure
-        # plt.show()
-        plt.close()
+        figs.add(_name(task, "interaction_effects", c_class), "interaction_effects", fig, ax)
 
     # Return None -------------------------------------------------------------
     return fig
 
 
-def print_shap_interaction_values(task, results, plots_path):
+def print_shap_interaction_values(task, results, figs):
     """
     Plot SHAP interaction values.
 
@@ -1819,8 +1716,8 @@ def print_shap_interaction_values(task, results, plots_path):
         Dictionary holding the task describtion variables.
     results : dictionary
         Dictionary holding the results of the ml analyses.
-    plots_path : string
-        Path to the plots.
+    figs : _Figures
+        Collector that receives the finished figures.
 
     Returns
     -------
@@ -1840,7 +1737,7 @@ def print_shap_interaction_values(task, results, plots_path):
 
     # Plot shap values --------------------------------------------------------
     # Loop over classes
-    for c_class in range(n_classes):
+    for c_class in _class_loop(task, n_classes):
         # Get current shap values
         shap_values, base = get_shap_values(task, results["explainations"], c_class)
 
@@ -1854,7 +1751,7 @@ def print_shap_interaction_values(task, results, plots_path):
             # Make figure
             fig, ax = plt.subplots(figsize=(8, 5))
             # Plot SHAP dependence
-            dependence_plot(
+            _call(dependence_plot, figs.kwargs("interaction_values"), 
                 ind,
                 shap_values=shap_values.values,
                 features=pd.DataFrame(
@@ -1878,7 +1775,7 @@ def print_shap_interaction_values(task, results, plots_path):
                 ymax=None,
             )
             # Get the current figure and axes objects.
-            _, ax = plt.gcf(), plt.gca()
+            fig, ax = plt.gcf(), plt.gca()
             # Set x label size
             ax.set_xlabel(ax.get_xlabel(), fontsize=10)
             # Set x ticks size
@@ -1925,35 +1822,7 @@ def print_shap_interaction_values(task, results, plots_path):
 
             # Save plot -------------------------------------------------------
             # Make save path
-            save_path = _save_path(
-                plots_path,
-                task["ANALYSIS_NAME"]
-                + "_"
-                + "6"
-                + "_"
-                + task["y_name"][0]
-                + "_"
-                + "shap_interaction_values"
-                + "_"
-                + ind[0]
-                + "_"
-                + ind[1],
-            )
-            # Add class if no interactions and binary or multiclass
-            if not task["SHAP_INTERACTIONS"] and (
-                task["OBJECTIVE"] == "binary" or task["OBJECTIVE"] == "multiclass"
-            ):
-                # Make title string
-                save_path = save_path + "_class_" + str(c_class)
-            # Save figure
-            plt.savefig(save_path + ".png", dpi=150, bbox_inches="tight")
-            # Check if save as svg is enabled
-            if task["AS_SVG"]:
-                # Save figure
-                plt.savefig(save_path + ".svg", bbox_inches="tight")
-            # Show figure
-            # plt.show()
-            plt.close()
+            figs.add(_name(task, f"interaction_values:{ind[0]}:{ind[1]}", c_class), "interaction_values", fig, ax)
 
     # Return None -------------------------------------------------------------
     return fig
@@ -1962,27 +1831,48 @@ def print_shap_interaction_values(task, results, plots_path):
 def ilm_shap_values_graph(
     task,
     results,
-    plots_path="./",
+    figs,
     title=None,
-    exclude=[],
-    rename_dict={},
-    dpi=600,
+    exclude=None,
+    rename_dict=None,
     stars=False,
 ):
     """
-    Plot SHAP values.
+    Alternative graph of SHAP values (``shap_values_style='graph'``): a
+    beeswarm plot with effect sizes and p values added to the labels.
+
     Parameters
     ----------
     task : dictionary
         Dictionary holding the task describtion variables.
     results : dictionary
         Dictionary holding the results of the ml analyses.
-    plots_path : string
-        Path to the plots.
+    figs : _Figures
+        Collector that receives the finished figures.
+    title : str or None, default None
+        Title of the figure.
+    exclude : list of str or None, default None
+        Predictors to leave out.
+    rename_dict : dict or None, default None
+        Predictor name -> label shown in the figure.
+    stars : bool, default False
+        Use significance stars instead of p values.
+
+    These four options can also be given through
+    ``plot_kwargs={'shap_values': {...}}`` of :func:`make_figures`; all other
+    entries there go to the beeswarm plot.
+
     Returns
     -------
     None.
     """
+    # Own options may come from plot_kwargs; the rest goes to the beeswarm plot
+    user = figs.kwargs("shap_values")
+    title = user.pop("title", title)
+    exclude = user.pop("exclude", exclude) or []
+    rename_dict = user.pop("rename_dict", rename_dict) or {}
+    stars = user.pop("stars", stars)
+    beeswarm_kwargs = user
     # Classes -----------------------------------------------------------------
     # If no interactions and binary or multiclass
     if not task["SHAP_INTERACTIONS"] and (
@@ -1995,7 +1885,7 @@ def ilm_shap_values_graph(
         n_classes = 1
     # Plot shap values --------------------------------------------------------
     # Loop over classes
-    for c_class in range(n_classes):
+    for c_class in _class_loop(task, n_classes):
         # Get current shap values
         shap_values, base = get_shap_values(task, results["explainations"], c_class)
         # Get current shap effects
@@ -2079,7 +1969,7 @@ def ilm_shap_values_graph(
         extra_x_names_max_len = max(extra_x_names_max_len)
 
         # Plot SHAP values beeswarm -------------------------------------------
-        beeswarm(
+        _shap_call(beeswarm, beeswarm_kwargs, 
             shap_explainations,
             max_display=len(task["x_names"]),
             order=Explanation.abs.mean(0),
@@ -2130,7 +2020,7 @@ def ilm_shap_values_graph(
             metrics_str = (
                 f"R²pred={format_r(np.mean(r2))}"
                 + r"±"
-                + f"{format_p(np.std(r2), add_p=False)}, {format_p(pval_r2, keep_space=False)}"
+                + f"{format_p(np.std(r2), use_letter=False, keep_spaces=False, no_equals=True)}, {format_p(pval_r2, keep_spaces=False)}"
             )
         else:
             metrics_str = "Acc.="
@@ -2188,31 +2078,7 @@ def ilm_shap_values_graph(
 
         # Save plot -----------------------------------------------------------
         # Make save path
-        save_path = _save_path(
-            plots_path,
-            task["ANALYSIS_NAME"]
-            + "_"
-            + "3"
-            + "_"
-            + task["y_name"][0]
-            + "_"
-            + "shap_values",
-        )
-        # Add class if no interactions and binary or multiclass
-        if not task["SHAP_INTERACTIONS"] and (
-            task["OBJECTIVE"] == "binary" or task["OBJECTIVE"] == "multiclass"
-        ):
-            # Make title string
-            save_path = save_path + "_class_" + str(c_class)
-        # Save figure
-        plt.savefig(save_path + ".png", dpi=dpi, bbox_inches="tight")
-        # Check if save as svg is enabled
-        if task["AS_SVG"]:
-            # Save figure
-            plt.savefig(save_path + ".svg", dpi=dpi, bbox_inches="tight")
-        # Show figure
-        # plt.show()
-        plt.close()
+        figs.add(_name(task, "shap_values", c_class), "shap_values", fig, ax)
     # Return None -------------------------------------------------------------
     return fig
 
@@ -2235,94 +2101,178 @@ def _class_results(results, i_class):
     return out
 
 
-def _shap_figures(task, results, plots_path, def_shap_values, print_shap_effects_inter):
-    """All SHAP based figures of one task/results pair."""
-    # Plot SHAP effects
-    print_shap_effects(task, results, plots_path)
-    # Plot SHAP effects distribution
-    print_shap_effects_distribution(task, results, plots_path)
-    # Plot SHAP values
-    if def_shap_values:
-        print_shap_values(task, results, plots_path)
+def _shap_figures(task, results, figs, types, style):
+    """Draw the requested SHAP based figures of one task/results pair."""
+    if "shap_effects" in types:
+        print_shap_effects(task, results, figs)
+    if "shap_effects_distribution" in types:
+        print_shap_effects_distribution(task, results, figs)
+    if "shap_values" in types:
+        if style == "beeswarm":
+            print_shap_values(task, results, figs)
+        else:
+            ilm_shap_values_graph(task, results, figs)
+    if "dependence" in types:
+        print_shap_dependences(task, results, figs)
+    if "interaction_effects" in types:
+        print_shap_effects_interactions(task, results, figs)
+    if "interaction_values" in types:
+        print_shap_interaction_values(task, results, figs)
+
+
+def _check_plot_types(plot_type, interactions):
+    """Validate ``plot_type``; return the types in drawing order."""
+    if plot_type is None:
+        types = list(DEFAULT_PLOT_TYPES)
+    elif isinstance(plot_type, str) and plot_type == "all":
+        types = [t for t in PLOT_TYPES if interactions or t not in INTERACTION_PLOT_TYPES]
     else:
-        ilm_shap_values_graph(task, results, plots_path)
-    # Plot SHAP dependencies
-    print_shap_dependences(task, results, plots_path)
-    if task["SHAP_INTERACTIONS"] and print_shap_effects_inter:
-        # Plot SHAP effects interactions
-        print_shap_effects_interactions(task, results, plots_path)
-        # Plot SHAP interaction values
-        print_shap_interaction_values(task, results, plots_path)
+        types = [plot_type] if isinstance(plot_type, str) else list(plot_type)
+        unknown = [t for t in types if t not in PLOT_TYPES]
+        if unknown:
+            raise ValueError(
+                f"Unknown plot_type {unknown}. Choose from {PLOT_TYPES} or 'all'."
+            )
+        missing = [t for t in types if t in INTERACTION_PLOT_TYPES and not interactions]
+        if missing:
+            raise ValueError(
+                f"{missing} need SHAP interaction values: fit the estimator "
+                "with shap_interactions=True."
+            )
+    return [t for t in PLOT_TYPES if t in types]
+
+
+def _check_figsize(figsize):
+    """Validate ``figsize`` (None, a pair, or a dict plot type -> pair)."""
+
+    def pair(x):
+        try:
+            w, h = x
+            return float(w) > 0 and float(h) > 0
+        except (TypeError, ValueError):
+            return False
+
+    if figsize is None or (not isinstance(figsize, dict) and pair(figsize)):
+        return
+    if isinstance(figsize, dict):
+        bad = [k for k, v in figsize.items() if k not in PLOT_TYPES or not pair(v)]
+        if not bad:
+            return
+        raise ValueError(
+            f"figsize entries {bad} are invalid: keys must be in {PLOT_TYPES} "
+            "and values (width, height) in inches."
+        )
+    raise ValueError("figsize must be None, (width, height) or a dict of those.")
 
 
 def make_figures(
     model,
-    figures_dir=None,
-    print_param_distrib=False,
-    print_shap_effects_inter=True,
-    add_multiple_comparison_correction=False,
-    def_shap_values=True,
-    as_svg=False,
+    plot_type=None,
+    figsize=None,
+    plot_kwargs=None,
+    output_dir=None,
+    fig_format="png",
+    dpi=150,
+    classes=None,
+    shap_values_style="beeswarm",
+    multiple_comparison_correction=False,
 ):
     """
-    Draw the figures of a fitted estimator.
-
-    A sub-directory ``<figures_dir>/<target>_plots`` is created holding:
-
-    * model fit: regression scatter (predicted vs. true) and violin plots of
-      R2 / MAE against the shuffled-target baseline; or, for classification,
-      a class-weighted confusion matrix and violin plot of the balanced
-      accuracy against the baseline,
-    * SHAP effects (mean absolute SHAP value per predictor) and their
-      distribution over outer folds, with the baseline from the shuffled
-      model,
-    * SHAP value plots (beeswarm) and dependence plots,
-    * if the estimator used ``shap_interactions=True``: pairwise interaction
-      effects and interaction value plots.
-
-    For binary and multiclass tasks effects are drawn per class (for binary
-    tasks class 0 is the mirror image of class 1). For multiclass targets with
-    SHAP interaction values, all SHAP figures are drawn for every class
-    (file names end in ``_class_<label>``).
-
-    The p values printed in the figures come from a one-sided corrected
-    resampled t-test (Nadeau & Bengio, 2003) of the real model against the
-    shuffled-target model over the outer folds, see the package README for
-    caveats.
+    Draw figures of a fitted estimator and return them for further editing.
 
     Parameters
     ----------
     model : NCVGBDTRegressor, NCVGBDTClassifier, str or path
         A fitted estimator, or the directory of a stored one (see
         :func:`ncvgbdt.load_model`).
-    figures_dir : str, path or None, default None
-        Directory in which ``<target>_plots`` is created (created if
-        missing). None: ``<output_dir>/figures`` of the estimator, or the
-        current directory if the estimator has no ``output_dir``.
-    print_param_distrib : bool, default False
-        Also plot the distributions of the tuned hyperparameters over folds.
-    print_shap_effects_inter : bool, default True
-        Plot the interaction figures if the estimator computed SHAP
-        interaction values. Set False to skip them (they are slow).
-    add_multiple_comparison_correction : bool, default False
+    plot_type : str, list of str or None, default None
+        Which figures to draw. ``None``: ``'fit'``, ``'shap_effects'``,
+        ``'shap_effects_distribution'`` and ``'shap_values'``. ``'all'``:
+        every type that applies. Types:
+
+        * ``'fit'``: regression: predicted vs. true (``fit_scatter``) and
+          violin plots of R2 / MAE against the shuffled-target baseline
+          (``fit_violin``); classification: class-weighted confusion matrix
+          (``fit_confusion``) and violin plot of the balanced accuracy.
+        * ``'shap_effects'``: mean absolute SHAP value per predictor with
+          effect sizes and p values against the shuffled-target model.
+        * ``'shap_effects_distribution'``: the same as violin plots over the
+          outer folds, real vs. shuffled model.
+        * ``'shap_values'``: SHAP beeswarm plot (or the alternative graph, see
+          ``shap_values_style``).
+        * ``'dependence'``: one SHAP dependence plot per predictor (many
+          figures).
+        * ``'interaction_effects'`` and ``'interaction_values'``: pairwise
+          interaction effects and one interaction dependence plot per ordered
+          pair of predictors (many figures); need ``shap_interactions=True``.
+        * ``'parameters'``: distributions of the tuned hyperparameters.
+
+        For classification, per-class types are drawn once per class (for
+        binary targets class 0 is the mirror image of class 1; for multiclass
+        targets with interaction values all SHAP types are drawn per class).
+    figsize : tuple, dict or None, default None
+        ``None``: default sizes, which depend on the number of predictors,
+        classes and metrics. A ``(width, height)`` pair in inches is applied
+        to every figure; a dict maps plot types to such pairs (types not
+        listed keep their default).
+    plot_kwargs : dict or None, default None
+        Keyword arguments for the drawing call of a figure kind; they
+        override the defaults. Keys (figure kinds) and the call that receives
+        them: ``'fit_scatter'`` (``Axes.scatter``), ``'fit_violin'`` and
+        ``'shap_effects_distribution'`` (``seaborn.violinplot``),
+        ``'fit_confusion'`` and ``'interaction_effects'``
+        (``seaborn.heatmap``), ``'shap_effects'`` (``Series.plot``),
+        ``'shap_values'`` (``shap.plots.beeswarm``; with
+        ``shap_values_style='graph'`` also ``title``, ``exclude``,
+        ``rename_dict`` and ``stars``, see :func:`ilm_shap_values_graph`),
+        ``'dependence'`` (``shap.plots.scatter``), ``'interaction_values'``
+        (``shap.dependence_plot``) and ``'parameters'``
+        (``seaborn.histplot``). Everything else can be changed afterwards on
+        the returned figures.
+    output_dir : str, path or None, default None
+        Directory in which to save the figures (see :func:`save_figures`).
+        ``None``: nothing is written.
+    fig_format : {'png', 'svg', 'pdf'} or list of them, default 'png'
+        File format(s) used if ``output_dir`` is given.
+    dpi : int, default 150
+        Resolution of PNG files (and of raster parts of other formats).
+    classes : list or None, default None
+        Classification only: labels of the classes to draw for per-class
+        figures. ``None``: all classes.
+    shap_values_style : {'beeswarm', 'graph'}, default 'beeswarm'
+        ``'beeswarm'``: standard SHAP beeswarm plot. ``'graph'``: alternative
+        graph with effect sizes and p values (:func:`ilm_shap_values_graph`).
+    multiple_comparison_correction : bool, default False
         Bonferroni correction: multiply every SHAP-effect p value by the
         number of predictors (for interaction effects by the number of
         predictors squared), capped at 1.
-    def_shap_values : bool, default True
-        True: standard SHAP beeswarm plot. False: alternative graph of SHAP
-        values (:func:`ilm_shap_values_graph`).
-    as_svg : bool, default False
-        Additionally store every figure as SVG.
 
     Returns
     -------
-    str
-        Path of the directory holding the figures.
+    dict
+        ``{name: (fig, ax)}`` in drawing order. ``fig`` is a matplotlib
+        ``Figure``; ``ax`` is its main ``Axes`` (for figures with several
+        rows, the array of ``Axes``). Names are stable, e.g. ``'fit_scatter'``,
+        ``'shap_values'``, ``'shap_effects:class_1'``, ``'dependence:wt'``,
+        ``'interaction_values:a:b:class_0'``. The p values and effect sizes
+        in the figures come from a one-sided corrected resampled t-test
+        (Nadeau & Bengio, 2003), see the README for caveats.
 
     Raises
     ------
     sklearn.exceptions.NotFittedError
         If the estimator is not fitted.
+    ValueError
+        For an unknown ``plot_type``, interaction types without interaction
+        values, or invalid ``figsize``, ``plot_kwargs``, ``fig_format``,
+        ``dpi`` or ``classes``.
+
+    Notes
+    -----
+    Figures are drawn with pyplot and stay open until you close them;
+    ``plot_type='all'`` can create dozens. Close them with
+    ``plt.close('all')`` (or ``plt.close(fig)``) when done. Edit a figure and
+    save it again with :func:`save_figures`.
     """
 
     # Get the fitted estimator ------------------------------------------------
@@ -2334,64 +2284,125 @@ def make_figures(
         from sklearn.exceptions import NotFittedError
 
         raise NotFittedError("Fit the estimator before plotting.")
-    if figures_dir is None:
-        out = getattr(model, "output_dir", None)
-        figures_dir = os.path.join(out, "figures") if out else "./"
 
-    # Task and results --------------------------------------------------------
+    # Check arguments (before anything is drawn) --------------------------------
     task = dict(model.task_)
-    # Add multiple comparison correction to task
-    task["MCC"] = add_multiple_comparison_correction
-    # Add as svg to task
-    task["AS_SVG"] = as_svg
+    interactions = task["SHAP_INTERACTIONS"]
+    types = _check_plot_types(plot_type, interactions)
+    _check_figsize(figsize)
+    if plot_kwargs is not None:
+        bad = [
+            k
+            for k, v in plot_kwargs.items()
+            if k not in PLOT_KWARGS_KINDS or not isinstance(v, dict)
+        ]
+        if bad:
+            raise ValueError(
+                f"plot_kwargs entries {bad} are invalid: keys must be in "
+                f"{PLOT_KWARGS_KINDS} and values dicts."
+            )
+    if shap_values_style not in ("beeswarm", "graph"):
+        raise ValueError("shap_values_style must be 'beeswarm' or 'graph'.")
+    _check_format(fig_format, dpi)
+    labels = list(model.classes_) if hasattr(model, "classes_") else None
+    if classes is not None:
+        if labels is None:
+            raise ValueError("classes can only be used for classification.")
+        unknown = [c for c in classes if c not in labels]
+        if unknown:
+            raise ValueError(f"Unknown classes {unknown}; the classes are {labels}.")
+    select = None if classes is None else [labels.index(c) for c in classes]
+
+    # Task for the figure functions -------------------------------------------------
+    task["MCC"] = bool(multiple_comparison_correction)
+    task["CLASS_LABELS"] = labels
+    task["CLASS_SELECT"] = select
     results = model.results_
-    # Plots path
-    plots_path = os.path.join(figures_dir, task["y_name"][0] + "_plots")
-    # Create plots dir
-    create_dir(plots_path)
+    figs = _Figures(figsize, plot_kwargs)
 
-    # Plot parameter distributions --------------------------------------------
-    if print_param_distrib:
-        print_parameter_distributions(task, results, plots_path)
-
-    # Plot model fit ----------------------------------------------------------
-    # Regressor
-    if task["OBJECTIVE"] == "regression":
-        # Print model fit as scatter plot
-        print_regression_scatter(task, results, plots_path)
-        # Print model fit as violinplot of metrics
-        print_regression_violin(task, results, plots_path)
-    # Classification
-    elif task["OBJECTIVE"] in ("binary", "multiclass"):
-        # Print model fit as confusion matrix
-        print_classification_confusion(task, results, plots_path)
-        # Print model fit as violinplot of metrics
-        print_classification_violin(task, results, plots_path)
-    # Other
-    else:
-        # Raise error
-        raise ValueError("OBJECTIVE not found.")
-
-    # SHAP figures ------------------------------------------------------------
-    if task["OBJECTIVE"] == "multiclass" and task["SHAP_INTERACTIONS"]:
+    # Draw ----------------------------------------------------------------------
+    if "parameters" in types:
+        print_parameter_distributions(task, results, figs)
+    if "fit" in types:
+        if task["OBJECTIVE"] == "regression":
+            print_regression_scatter(task, results, figs)
+            print_regression_violin(task, results, figs)
+        else:
+            print_classification_confusion(task, results, figs)
+            print_classification_violin(task, results, figs)
+    shap_types = [t for t in types if t not in ("fit", "parameters")]
+    if shap_types and task["OBJECTIVE"] == "multiclass" and interactions:
         # Interaction values exist per class. The interaction figures expect
         # one (rows x features x features) array, so draw the SHAP figures
         # for every class separately, like for a binary target.
-        for i_class, label in enumerate(model.classes_):
+        for i_class, label in enumerate(labels):
+            if select is not None and i_class not in select:
+                continue
             task_c = dict(
-                task, OBJECTIVE="binary", y_name=[f"{task['y_name'][0]}_class_{label}"]
+                task,
+                OBJECTIVE="binary",
+                y_name=[f"{task['y_name'][0]}_class_{label}"],
+                NAME_SUFFIX=f":class_{label}",
             )
             _shap_figures(
-                task_c,
-                _class_results(results, i_class),
-                plots_path,
-                def_shap_values,
-                print_shap_effects_inter,
+                task_c, _class_results(results, i_class), figs, shap_types,
+                shap_values_style,
             )
-    else:
-        _shap_figures(
-            task, results, plots_path, def_shap_values, print_shap_effects_inter
-        )
+    elif shap_types:
+        _shap_figures(task, results, figs, shap_types, shap_values_style)
 
-    # Return path of the figures ----------------------------------------------
-    return plots_path
+    # Save and return ----------------------------------------------------------------
+    if output_dir is not None:
+        save_figures(figs.figures, output_dir, fig_format, dpi)
+    return figs.figures
+
+
+def _check_format(fig_format, dpi):
+    """Validate file format(s) and resolution; return the formats as list."""
+    formats = [fig_format] if isinstance(fig_format, str) else list(fig_format)
+    bad = [f for f in formats if f not in FIG_FORMATS]
+    if bad or not formats:
+        raise ValueError(f"fig_format must be one or more of {FIG_FORMATS}, got {fig_format!r}.")
+    if not isinstance(dpi, (int, float)) or isinstance(dpi, bool) or dpi <= 0:
+        raise ValueError("dpi must be a positive number.")
+    return formats
+
+
+def save_figures(figures, output_dir, fig_format="png", dpi=150):
+    """
+    Save figures (e.g. from :func:`make_figures`, possibly edited) as files.
+
+    Parameters
+    ----------
+    figures : dict
+        ``{name: (fig, ax)}`` as returned by :func:`make_figures`.
+    output_dir : str or path
+        Directory (created if missing). Files are named after the figure
+        names; characters that file names do not allow are replaced
+        (``':'`` becomes ``'__'``), e.g. ``dependence__wt__class_1.png``.
+        Existing files of the same name are overwritten, so use one
+        directory per estimator.
+    fig_format : {'png', 'svg', 'pdf'} or list of them, default 'png'
+        File format(s).
+    dpi : int, default 150
+        Resolution of PNG files (and of raster parts of other formats).
+
+    Returns
+    -------
+    list of str
+        Paths of the files written.
+    """
+    formats = _check_format(fig_format, dpi)
+    os.makedirs(output_dir, exist_ok=True)
+    paths, used = [], set()
+    for name, (fig, _) in figures.items():
+        base = _file_stem(name)
+        stem, k = base, 2
+        while stem in used:  # names that only differ in replaced characters
+            stem, k = f"{base}_{k}", k + 1
+        used.add(stem)
+        for fmt in formats:
+            path = os.path.join(output_dir, f"{stem}.{fmt}")
+            fig.savefig(path, dpi=dpi, bbox_inches="tight")
+            paths.append(path)
+    return paths

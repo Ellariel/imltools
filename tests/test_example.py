@@ -99,6 +99,7 @@ def test_reproducible(run_a):
 
 def test_figures(run_a):
     d, model = run_a
-    out = make_figures(model, figures_dir=d / 'figs')
-    plots = list(Path(out).glob('*.png'))
-    assert len(plots) >= 8
+    figs = make_figures(model, output_dir=d / 'figs')
+    assert {'fit_scatter', 'fit_violin', 'shap_effects',
+            'shap_effects_distribution', 'shap_values'} <= set(figs)
+    assert (d / 'figs' / 'fit_scatter.png').exists()

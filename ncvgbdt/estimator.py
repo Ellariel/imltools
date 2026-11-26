@@ -897,7 +897,7 @@ class NCVGBDTRegressor(_NCVGBDTBase):
     >>> model = NCVGBDTRegressor(x_con_names=['wt'], output_dir='out')
     >>> model.fit(df[['wt']], df['mpg'])               # doctest: +SKIP
     >>> model.cv_results_                              # doctest: +SKIP
-    >>> make_figures(model, figures_dir='out/figures')  # doctest: +SKIP
+    >>> figs = make_figures(model, output_dir='out/figures')  # doctest: +SKIP
     """
 
     def _get_objective(self, y):

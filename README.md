@@ -347,6 +347,39 @@ its mirror image). Effects of correlated predictors are shared between them (see
 - Fold assignment depends on the order of the group labels; changing the sort
   order of groups changes folds, hence scores.
 
+### Run time and large data sets
+The run time is dominated by the number of LightGBM fits (1000 rounds, 100 leaves
+each). Roughly `5 * R * (S * 5 * r + 2)` models are fitted, with `R = n_rep_outer_cv`,
+`S = n_samples_rs` and `r` the number of inner repeats: `n_samples_inner_cv` divided
+by the rows of the training part, limited to 1 to 10 (`refit=True` adds
+`S * 5 * r + 1`). With the defaults (`R = 10`, `S = 100`) that is about 25,000 fits for
+more than 10,000 rows, and up to ten times as many for 1,000 rows (`r = 10`). The
+defaults are meant for a thorough analysis, not a first look. To speed up, roughly in
+this order:
+
+- **Time a small run first** (`n_rep_outer_cv=1, n_samples_rs=5`): the cost is linear
+  in both, so you can extrapolate.
+- **`evaluation='TT'`** uses one group-disjoint split instead of `5 * n_rep_outer_cv`
+  folds. It is by far the cheapest, but with one fold there are no intervals or p
+  values over folds, and the estimate is noisier.
+- **`n_rep_outer_cv`**: 1 to 3 instead of 10 (every repetition adds 5 outer folds).
+- **`n_samples_rs`**: the search has only three parameters, so a few dozen draws are
+  often enough; check that the scores do not change much when you raise it.
+- **`n_samples_inner_cv`**: for small data sets it sets `r`; lower it (e.g. to the
+  number of training rows) to use one inner repetition.
+- **Leave `shap_interactions` off** (the default). Interaction values cost time and
+  memory in proportion to features squared (times the number of classes for multiclass
+  targets) and make the stored JSON files large. `max_samples_shap` (default 100 rows
+  per outer fold) can usually stay as it is.
+- **`n_jobs`** (default `-2`) parallelizes the search; each LightGBM model itself runs
+  on one thread. Lower it if memory is tight, because the workers may each need a copy
+  of the training data.
+- **Subsample yourself** if the data are huge: nothing is subsampled automatically, and
+  everything is held in memory as pandas data. Pass only the columns you need, and
+  subsample whole *groups*, not rows, so that the grouping stays intact.
+- For long runs set **`output_dir` and `resume=True`**, so an interruption does not
+  cost the finished folds.
+
 ### Limitations
 - Fixed 5 outer and inner folds; no sample weights; no time-series splits.
 - Hyperparameter search covers three parameters only (see above).
